@@ -1,0 +1,48 @@
+load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
+load("//kernel/bpf:defs.bzl", "rust_bpf_object")
+
+oncall("kernel_monitoring")
+
+RUST_FLAGS = [
+    "-D",
+    "rust-2018-idioms",
+    "-D",
+    "warnings",
+    "-D",
+    "missing-debug-implementations",
+    "-Wunused-crate-dependencies",
+]
+
+rust_binary(
+    name = "rwalker",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {"ignore_rule": True},
+    named_deps = {},
+    rustc_flags = RUST_FLAGS,
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:blazesym",
+        "fbsource//third-party/rust:chrono",
+        "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:libbpf-rs",
+        "fbsource//third-party/rust:plain",
+        "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:slog",
+        "fbsource//third-party/rust:slog-term",
+        ":rwalker_bpf",
+        "//cli/rust/cli:cli",
+        "//common/rust/logging:logging",
+        "//common/rust/shed/fbinit:fbinit",
+    ],
+)
+
+rust_bpf_object(
+    name = "rwalker_bpf",
+    srcs = [
+        "src/bpf/rwalker.bpf.c",
+    ],
+    extra_clang_args = "-DFBCODE_BUILD=1 -mcpu=v3",
+    oncall = "kernel_monitoring",
+    output_obj_file = "rwalker.bpf.o",
+    output_skel_file = "rwalker.skel.rs",
+)

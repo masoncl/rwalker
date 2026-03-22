@@ -1,0 +1,197 @@
+# rwalker
+
+A BPF-based tool for diagnosing stuck tasks and CPU contention on Linux.
+rwalker uses BPF iterators to walk kernel task state and perf events to
+profile CPU usage, with symbolized kernel stack traces and perf-report
+style output.
+
+## Building
+
+Requires a C compiler with BPF support (clang), libbpf headers, and a
+Rust toolchain.
+
+```
+cargo build --release
+```
+
+The build compiles the BPF C program (`src/bpf/rwalker.bpf.c`) into a
+skeleton that is linked into the Rust binary.  The build script
+post-processes the generated bindings to work around a duplicate enum
+discriminant in newer kernel headers.
+
+## Usage
+
+rwalker requires root (or `CAP_BPF` + `CAP_PERFMON`) to load BPF
+programs and attach perf events.
+
+### D-state task detection (default)
+
+```
+rwalker
+```
+
+Shows tasks in TASK_UNINTERRUPTIBLE (D state) or TASK_RUNNING, with
+kernel stack traces and wait times.  Output includes per-task details
+followed by a histogram of common stack traces.
+
+### Stuck task detection
+
+```
+rwalker --stuck
+```
+
+Loops 5 times at 2-second intervals looking for tasks that have been in
+D state for at least 1 second.  Exits as soon as stuck tasks are found.
+
+### CPU profiling
+
+```
+rwalker -p 5
+```
+
+Profiles kernel CPU usage for 5 seconds using hardware perf events
+(CPU cycles at 4000 Hz, matching `perf record` defaults).  Userspace
+samples are excluded.  Output is grouped by leaf function (where the
+CPU was executing) with a call chain tree showing all paths that led
+there -- similar to `perf report --all-kernel`.
+
+### Options
+
+```
+Usage: rwalker [OPTIONS]
+
+Options:
+  -v, --verbose        Print function addresses as well as names
+  -a, --all            Dump all task stacks (not just D/R state)
+  -c, --command <CMD>  Filter on command name (accepts a regex)
+  -q, --quick          Skip expensive DWARF symbolization
+  -r, --running        Only print running tasks
+  -s, --stuck          Loop looking for stuck D-state tasks
+  -w, --waiting <N>    Only print tasks waiting longer than N seconds [default: 0]
+  -i, --interval <N>   Re-read task stacks every N seconds [default: 0]
+  -C, --count <N>      Stop after N iterations in interval mode [default: 0]
+  -p, --profile <N>    Profile CPU usage for N seconds [default: 0]
+  -P, --cpus <CPUS>    CPU mask for profiling (e.g. "0-3" or "1,4,7")
+  -f, --freq <N>       Sampling frequency in Hz [default: 4000]
+  -h, --help           Print help
+```
+
+### Examples
+
+Find tasks stuck for more than 10 seconds:
+```
+rwalker -w 10
+```
+
+Profile CPU 1 for 10 seconds:
+```
+rwalker -p 10 -P 1
+```
+
+Profile CPUs 0-7 for 5 seconds with quick symbolization:
+```
+rwalker -p 5 -P 0-7 -q
+```
+
+Show all tasks matching "btrfs" with full addresses:
+```
+rwalker -a -c btrfs -v
+```
+
+Monitor D-state tasks every 5 seconds, 20 iterations:
+```
+rwalker -i 5 -C 20
+```
+
+## Output
+
+### D-state mode
+
+Each task is printed with its comm, PID, state, wait time, and CPU,
+followed by a symbolized kernel stack trace:
+
+```
+comm kworker/0:1 pid 12345 state D wait 5.23 queue CPU 0
+                 rwsem_down_write_slowpath
+                 btrfs_commit_transaction
+                 ...
+```
+
+After individual tasks, a histogram groups tasks by common stack traces.
+
+### Profiling mode
+
+Output is grouped by the function consuming the most CPU, with a tree
+showing all call chains that led to it:
+
+```
+>>> 22.98%  _raw_spin_lock_irqsave  Comms: some_process, some_other_process
+            |
+            entry_SYSCALL_64_after_hwframe+0x73 common.c:73
+            do_syscall_64+0x82 common.c:52
+            __x64_sys_futex+0x9a syscalls.c:160
+            futex_q_lock+0x42 core.c:525
+            |--15.21%--queued_spin_lock_slowpath+0x1a3 qspinlock.c:474
+             --7.77%--_raw_spin_lock_irqsave+0x32 spinlock.c:162
+```
+
+Branches below 0.25% of total samples are pruned.  The `+0xNN`
+offset and source location shown at each node correspond to the
+instruction offset that collected the most samples.
+
+## Architecture
+
+```
+src/
+  bpf/
+    rwalker.bpf.c   BPF programs (task iterator + perf_event profiler)
+    vmlinux.h        Kernel type definitions for BPF CO-RE
+  main.rs            CLI, task walking, profiling output, call tree display
+  profile.rs         Profiler: perf event setup, ringbuf consumption, stack aggregation
+  task.rs            Task struct: state decoding, wait time tracking, stack extraction
+  syscall.rs         perf_event_open syscall wrapper and perf_event_attr definition
+  cpumask.rs         CPU mask string parser (e.g. "0-3,7")
+  skel.rs            Generated BPF skeleton include wrapper
+build.rs             Build script: BPF compilation via libbpf-cargo
+```
+
+### BPF programs
+
+**`get_task_stacks`** (iter/task) -- Iterates all kernel tasks, filters
+by state (D-state, running, or all), collects kernel stack traces via
+`bpf_get_task_stack()`, and writes results through `bpf_seq_write()`.
+Uses BPF CO-RE for portability across kernel versions (pre/post 5.14
+task state field, `sched_info.run_delay` with field existence check).
+
+**`profile`** (perf_event) -- Attached to hardware CPU cycle perf events.
+Skips idle tasks by comparing against the per-CPU runqueue idle task.
+Captures kernel stacks via `bpf_get_stack()` and submits through a 16MB
+ringbuf.
+
+### Rust components
+
+**Profiler** manages perf event lifecycle: opens perf events per CPU,
+attaches the BPF program, builds a ringbuf consumer.  Raw stacks are
+aggregated in a `HashMap<ProfileFrame, StackCounter>` keyed by
+(addresses, cpu).
+
+**Call tree display** symbolizes raw stacks to function names, groups by
+leaf function, builds a `CallTreeNode` trie from root caller to leaf,
+and prints with branching percentages at divergence points.  Each node
+tracks per-offset hit counts to display the most common instruction
+offset and source location.
+
+## Dependencies
+
+- [libbpf-rs](https://github.com/libbpf/libbpf-rs) -- BPF program loading and map interaction
+- [libbpf-cargo](https://github.com/libbpf/libbpf-rs) -- BPF skeleton generation at build time
+- [blazesym](https://github.com/libbpf/blazesym) -- Kernel address symbolization with DWARF support
+- [clap](https://github.com/clap-rs/clap) -- Command line argument parsing
+- [plain](https://crates.io/crates/plain) -- Safe transmute for C struct deserialization
+- [chrono](https://github.com/chronotope/chrono) -- Timestamp formatting
+- [regex](https://github.com/rust-lang/regex) -- Command name filtering
+- [anyhow](https://github.com/dtolnay/anyhow) -- Error handling
+
+## License
+
+Dual BSD/GPL (matching the BPF program license).
