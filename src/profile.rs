@@ -104,33 +104,50 @@ impl<'a> Profiler<'a> {
             cpus_to_profile,
         }
     }
-    fn init_perf_monitor(&self, freq: u64) -> Result<Vec<i32>, anyhow::Error> {
-        let nprocs = libbpf_rs::num_possible_cpus().unwrap();
-        let pid = -1;
-        let mut attr = Box::new(unsafe { mem::zeroed::<syscall::perf_event_attr>() });
-
-        let default_cpus: Vec<u32> = (0..nprocs as u32).collect();
-        let cpus = self.cpus_to_profile.as_ref().unwrap_or(&default_cpus);
-
-        attr._type = syscall::PERF_TYPE_HARDWARE;
-        attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
-        attr.config = syscall::PERF_COUNT_HW_CPU_CYCLES;
-        // Use frequency mode like perf record: sample N times per second
-        attr.sample.sample_freq = freq;
-        attr.flags = syscall::PERF_ATTR_FLAG_FREQ
-            | syscall::PERF_ATTR_FLAG_EXCLUDE_USER
-            | syscall::PERF_ATTR_FLAG_EXCLUDE_GUEST;
+    fn try_open_perf_events(
+        attr: &syscall::perf_event_attr,
+        cpus: &[u32],
+    ) -> Result<Vec<i32>, anyhow::Error> {
         cpus.iter()
             .map(|cpu| {
-                let fd = syscall::perf_event_open(attr.as_ref(), pid, *cpu as i32, -1, 0) as i32;
+                let fd = syscall::perf_event_open(attr, -1, *cpu as i32, -1, 0) as i32;
                 if fd == -1 {
                     Err(anyhow::Error::from(io::Error::last_os_error()))
-                        .context("failed to open perf event")
+                        .context(format!("failed to open perf event on CPU {}", cpu))
                 } else {
                     Ok(fd)
                 }
             })
             .collect()
+    }
+
+    fn init_perf_monitor(&self, freq: u64, force_sw: bool) -> Result<Vec<i32>, anyhow::Error> {
+        let nprocs = libbpf_rs::num_possible_cpus().unwrap();
+        let mut attr = Box::new(unsafe { mem::zeroed::<syscall::perf_event_attr>() });
+
+        let default_cpus: Vec<u32> = (0..nprocs as u32).collect();
+        let cpus = self.cpus_to_profile.as_ref().unwrap_or(&default_cpus);
+
+        attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
+        attr.sample.sample_freq = freq;
+        attr.flags = syscall::PERF_ATTR_FLAG_FREQ
+            | syscall::PERF_ATTR_FLAG_EXCLUDE_USER
+            | syscall::PERF_ATTR_FLAG_EXCLUDE_GUEST;
+
+        if !force_sw {
+            // Try hardware CPU cycles first (best accuracy)
+            attr._type = syscall::PERF_TYPE_HARDWARE;
+            attr.config = syscall::PERF_COUNT_HW_CPU_CYCLES;
+            if let Ok(fds) = Self::try_open_perf_events(&attr, cpus) {
+                return Ok(fds);
+            }
+            eprintln!("Hardware PMU not available, falling back to software CPU clock");
+        }
+
+        // Software CPU clock (works in VMs without PMU)
+        attr._type = syscall::PERF_TYPE_SOFTWARE;
+        attr.config = syscall::PERF_COUNT_SW_CPU_CLOCK;
+        Self::try_open_perf_events(&attr, cpus)
     }
 
     fn attach_perf_event(
@@ -147,11 +164,16 @@ impl<'a> Profiler<'a> {
             .collect()
     }
 
-    pub fn setup(&mut self, skel: &'a RwalkerSkel<'a>, freq: u64) -> Result<(), anyhow::Error> {
+    pub fn setup(
+        &mut self,
+        skel: &'a RwalkerSkel<'a>,
+        freq: u64,
+        force_sw: bool,
+    ) -> Result<(), anyhow::Error> {
         let map = self.perf_stack_map.clone();
         let events = self.total_events.clone();
 
-        self.pefds = Some(Profiler::<'a>::init_perf_monitor(self, freq)?);
+        self.pefds = Some(Profiler::<'a>::init_perf_monitor(self, freq, force_sw)?);
         self.links = Some(Profiler::<'a>::attach_perf_event(
             self.pefds.as_ref().unwrap(),
             &skel.progs.profile,

@@ -707,6 +707,9 @@ pub struct Options {
     /// sampling frequency in Hz (samples per second per CPU)
     #[clap(long, short = 'f', value_parser, default_value_t = 4000)]
     freq: u64,
+    /// force software CPU clock events instead of hardware PMU
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    sw_perf: bool,
 }
 
 fn main() -> Result<()> {
@@ -764,7 +767,10 @@ fn main() -> Result<()> {
     let mut profiler = None;
     if options.profile > 0 {
         profiler = Some(profile::Profiler::new(cpus_to_profile));
-        profiler.as_mut().unwrap().setup(&skel, options.freq)?;
+        profiler
+            .as_mut()
+            .unwrap()
+            .setup(&skel, options.freq, options.sw_perf)?;
     }
 
     let mut loops = 0;

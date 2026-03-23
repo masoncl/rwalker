@@ -56,6 +56,9 @@ pub struct perf_event_attr {
 pub const PERF_TYPE_HARDWARE: u32 = 0;
 pub const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
 
+pub const PERF_TYPE_SOFTWARE: u32 = 1;
+pub const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+
 // perf_event_attr.flags bitfield positions (from include/uapi/linux/perf_event.h)
 pub const PERF_ATTR_FLAG_EXCLUDE_USER: u64 = 1 << 4;
 pub const PERF_ATTR_FLAG_FREQ: u64 = 1 << 10;
