@@ -151,18 +151,14 @@ int get_task_stacks(struct bpf_iter__task *ctx)
 SEC("perf_event")
 int profile(void *ctx)
 {
-	uint64_t pid_tgid = bpf_get_current_pid_tgid();
-	int tgid = pid_tgid >> 32;      /* userspace PID (process) */
-	int tid = pid_tgid & 0xffffffff; /* userspace TID (thread) */
+	struct task_struct *task = bpf_get_current_task_btf();
 	int cpu_id = bpf_get_smp_processor_id();
 	struct task_stack *t;
-	struct task_struct *task;
 	int32_t res;
 	struct rq *rq;
 
 	rq = (struct rq *)bpf_per_cpu_ptr(&runqueues, cpu_id);
 	if (rq) {
-		task = bpf_get_current_task_btf();
 		if (task == rq->idle)
 			return 0;
 	}
@@ -171,8 +167,13 @@ int profile(void *ctx)
 	if (!t)
 		return 1;
 
-	t->pid = tgid;
-	t->tgid = tid;
+	/* Use task_struct fields directly — these are always init-namespace
+	 * values, so containerized processes get host-visible PIDs that
+	 * map to /proc/<pid> on the host.  bpf_get_current_pid_tgid()
+	 * would return namespace-local PIDs instead.
+	 */
+	t->pid = task->tgid;  /* init-ns process ID */
+	t->tgid = task->pid;  /* init-ns thread ID */
 	t->task_ptr = 0;
 	t->wait_ns = 0;
 	t->switch_count = 0;
