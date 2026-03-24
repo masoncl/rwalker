@@ -38,6 +38,7 @@ pub mod task;
 use task::Task;
 
 mod cpumask;
+mod dwarf_unwind;
 mod profile;
 mod syscall;
 
@@ -1134,6 +1135,9 @@ pub struct Options {
     /// trace a kernel function via fentry (format: name:seconds, e.g. ksys_write:5)
     #[clap(long, value_parser)]
     kfunc: Option<String>,
+    /// use DWARF unwinding for user stacks (works without frame pointers)
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    dwarf: bool,
 }
 
 fn main() -> Result<()> {
@@ -1204,6 +1208,9 @@ fn main() -> Result<()> {
     } else {
         rodata.iter_mode = RWALKER_ITER_MODE_DSTATE;
     }
+    if options.dwarf {
+        rodata.dwarf_mode = 1;
+    }
 
     //
     // in stuck mode, loop a few times and exit as soon as we find some
@@ -1247,6 +1254,7 @@ fn main() -> Result<()> {
             offcpu,
             trace_name.clone(),
             use_kfunc,
+            options.dwarf,
         )?;
     }
 
@@ -1278,6 +1286,7 @@ fn main() -> Result<()> {
             loop {
                 let elapsed = start.elapsed();
                 if elapsed >= profile_duration {
+                    profiler.as_mut().unwrap().unwind_dwarf_samples();
                     print_perf_stacks(
                         profiler.as_mut().unwrap(),
                         &symbolizer,

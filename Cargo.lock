@@ -656,9 +656,11 @@ dependencies = [
  "blazesym",
  "chrono",
  "clap",
+ "gimli",
  "libbpf-cargo",
  "libbpf-rs",
  "libc",
+ "memmap2",
  "plain",
  "regex",
 ]

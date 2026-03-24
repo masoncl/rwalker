@@ -28,9 +28,11 @@ struct {
 
 const volatile int iter_mode = 0;
 const volatile uint64_t offcpu_min_ns = 1000000; /* 1ms default threshold */
+const volatile int dwarf_mode = 0;
 
 #define BPF_MAX_STACK_DEPTH 127
 #define BPF_MAX_STACK_SIZE (BPF_MAX_STACK_DEPTH * sizeof(stackframe_t))
+#define DWARF_STACK_SIZE 8192
 
 struct task_stack {
 	pid_t pid;
@@ -46,6 +48,18 @@ struct task_stack {
 	stackframe_t ustack[BPF_MAX_STACK_DEPTH];
 	u8 comm[TASK_COMM_LEN];
 };
+
+struct dwarf_sample {
+	struct task_stack ts;
+	uint64_t user_regs[3]; /* RIP, RSP, RBP */
+	uint32_t stack_len;
+	uint8_t user_stack[DWARF_STACK_SIZE];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 64 * 1024 * 1024);
+} dwarf_events SEC(".maps");
 
 struct task_struct___post514 {
 	unsigned int __state;
@@ -249,12 +263,76 @@ int offcpu_switch(u64 *ctx)
 	return 0;
 }
 
-SEC("fentry")
-int kfunc_event(void *ctx)
+/* Submit a dwarf sample: task_stack (kernel stack only) + raw user
+ * stack dump + registers.  Called from profile/trace/kfunc when
+ * dwarf_mode is enabled.
+ */
+static __always_inline int submit_dwarf_sample(void *ctx,
+					       struct task_struct *task)
+{
+	struct dwarf_sample *ds;
+	struct pt_regs *regs;
+	int32_t res;
+
+	ds = bpf_ringbuf_reserve(&dwarf_events, sizeof(*ds), 0);
+	if (!ds)
+		return 1;
+
+	ds->ts.pid = task->tgid;
+	ds->ts.tgid = task->pid;
+	ds->ts.task_ptr = 0;
+	ds->ts.wait_ns = 0;
+	ds->ts.switch_count = 0;
+	ds->ts.state = 0;
+	ds->ts.cpu = bpf_get_smp_processor_id();
+
+	if (bpf_get_current_comm(ds->ts.comm, TASK_COMM_LEN))
+		ds->ts.comm[0] = 0;
+
+	/* Kernel stack */
+	res = bpf_get_stack(ctx, ds->ts.kstack, BPF_MAX_STACK_SIZE, 0);
+	if (res < 0)
+		res = 0;
+	ds->ts.kstack_len = res / sizeof(stackframe_t);
+	ds->ts.ustack_len = 0;
+
+	/* User registers from pt_regs */
+	regs = (struct pt_regs *)bpf_task_pt_regs(task);
+	if (regs) {
+		ds->user_regs[0] = BPF_CORE_READ(regs, ip);
+		ds->user_regs[1] = BPF_CORE_READ(regs, sp);
+		ds->user_regs[2] = BPF_CORE_READ(regs, bp);
+	} else {
+		ds->user_regs[0] = 0;
+		ds->user_regs[1] = 0;
+		ds->user_regs[2] = 0;
+	}
+
+	/* Raw user stack dump */
+	if (ds->user_regs[1]) {
+		res = bpf_probe_read_user(ds->user_stack, DWARF_STACK_SIZE,
+					  (void *)ds->user_regs[1]);
+		ds->stack_len = (res == 0) ? DWARF_STACK_SIZE : 0;
+	} else {
+		ds->stack_len = 0;
+	}
+
+	bpf_ringbuf_submit(ds, 0);
+	return 0;
+}
+
+/* Common logic for kfunc/trace/profile: submit to normal ringbuf
+ * with frame-pointer user stacks, or to dwarf ringbuf with raw
+ * stack dump.
+ */
+static __always_inline int submit_sample(void *ctx)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	struct task_stack *t;
 	int32_t res;
+
+	if (dwarf_mode)
+		return submit_dwarf_sample(ctx, task);
 
 	t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
 	if (!t)
@@ -285,40 +363,16 @@ int kfunc_event(void *ctx)
 	return 0;
 }
 
+SEC("fentry")
+int kfunc_event(void *ctx)
+{
+	return submit_sample(ctx);
+}
+
 SEC("raw_tp")
 int trace_event(void *ctx)
 {
-	struct task_struct *task = bpf_get_current_task_btf();
-	struct task_stack *t;
-	int32_t res;
-
-	t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
-	if (!t)
-		return 0;
-
-	t->pid = task->tgid;
-	t->tgid = task->pid;
-	t->task_ptr = 0;
-	t->wait_ns = 0;
-	t->switch_count = 0;
-	t->state = 0;
-	t->cpu = bpf_get_smp_processor_id();
-
-	if (bpf_get_current_comm(t->comm, TASK_COMM_LEN))
-		t->comm[0] = 0;
-
-	res = bpf_get_stack(ctx, t->kstack, BPF_MAX_STACK_SIZE, 0);
-	if (res < 0)
-		res = 0;
-	t->kstack_len = res / sizeof(stackframe_t);
-
-	res = bpf_get_stack(ctx, t->ustack, BPF_MAX_STACK_SIZE, BPF_F_USER_STACK);
-	if (res < 0)
-		res = 0;
-	t->ustack_len = res / sizeof(stackframe_t);
-
-	bpf_ringbuf_submit(t, 0);
-	return 0;
+	return submit_sample(ctx);
 }
 
 SEC("perf_event")
@@ -326,8 +380,6 @@ int profile(void *ctx)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	int cpu_id = bpf_get_smp_processor_id();
-	struct task_stack *t;
-	int32_t res;
 	struct rq *rq;
 
 	rq = (struct rq *)bpf_per_cpu_ptr(&runqueues, cpu_id);
@@ -336,37 +388,5 @@ int profile(void *ctx)
 			return 0;
 	}
 
-	t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
-	if (!t)
-		return 1;
-
-	/* Use task_struct fields directly — these are always init-namespace
-	 * values, so containerized processes get host-visible PIDs that
-	 * map to /proc/<pid> on the host.  bpf_get_current_pid_tgid()
-	 * would return namespace-local PIDs instead.
-	 */
-	t->pid = task->tgid;  /* init-ns process ID */
-	t->tgid = task->pid;  /* init-ns thread ID */
-	t->task_ptr = 0;
-	t->wait_ns = 0;
-	t->switch_count = 0;
-	t->state = 0;
-	t->cpu = cpu_id;
-
-	if (bpf_get_current_comm(t->comm, TASK_COMM_LEN))
-		t->comm[0] = 0;
-
-	res = bpf_get_stack(ctx, t->kstack, BPF_MAX_STACK_SIZE, 0);
-	if (res < 0)
-		res = 0;
-	t->kstack_len = res / sizeof(stackframe_t);
-
-	res = bpf_get_stack(ctx, t->ustack, BPF_MAX_STACK_SIZE, BPF_F_USER_STACK);
-	if (res < 0)
-		res = 0;
-	t->ustack_len = res / sizeof(stackframe_t);
-
-	bpf_ringbuf_submit(t, 0);
-
-	return 0;
+	return submit_sample(ctx);
 }

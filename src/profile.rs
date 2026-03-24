@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::mem;
 
+use crate::dwarf_unwind::DwarfUnwinder;
 use crate::skel::rwalker::types::task_stack;
 use crate::skel::rwalker::RwalkerSkel;
 use libbpf_rs::RingBuffer;
@@ -15,6 +16,17 @@ use anyhow::Context;
 
 use crate::skel::BPF_MAX_STACK_DEPTH;
 use crate::syscall;
+
+const DWARF_STACK_SIZE: usize = 8192;
+
+/// Layout must match struct dwarf_sample in rwalker.bpf.c
+#[repr(C)]
+struct DwarfSample {
+    ts: task_stack,
+    user_regs: [u64; 3], // RIP, RSP, RBP
+    stack_len: u32,
+    user_stack: [u8; DWARF_STACK_SIZE],
+}
 
 // Raw stack frame keyed by addresses and pid.  The tree grouping
 // merges across CPUs by function name, so separating by CPU here would
@@ -119,15 +131,63 @@ fn event_handler(
     0
 }
 
+/// Raw dwarf sample stored for deferred unwinding
+pub struct RawDwarfSample {
+    pub pid: i32,
+    pub kstack: [u64; BPF_MAX_STACK_DEPTH],
+    pub kstack_len: i16,
+    pub comm: [u8; crate::skel::TASK_COMM_LEN],
+    pub wait_ns: u64,
+    pub user_regs: [u64; 3],
+    pub user_stack: Vec<u8>,
+}
+
+pub type DwarfSamples = Rc<RefCell<Vec<RawDwarfSample>>>;
+
+fn dwarf_event_handler(
+    total_events: &Rc<RefCell<u64>>,
+    total_ns: &Rc<RefCell<u64>>,
+    dwarf_samples: &DwarfSamples,
+    data: &[u8],
+) -> ::std::os::raw::c_int {
+    if data.len() != mem::size_of::<DwarfSample>() {
+        return 0;
+    }
+
+    let sample = unsafe { &*(data.as_ptr() as *const DwarfSample) };
+
+    if sample.ts.kstack_len <= 0 && sample.user_regs[0] == 0 {
+        return 0;
+    }
+
+    *total_events.borrow_mut() += 1;
+    *total_ns.borrow_mut() += sample.ts.wait_ns;
+
+    let stack_len = sample.stack_len as usize;
+    dwarf_samples.borrow_mut().push(RawDwarfSample {
+        pid: sample.ts.pid,
+        kstack: sample.ts.kstack,
+        kstack_len: sample.ts.kstack_len,
+        comm: sample.ts.comm,
+        wait_ns: sample.ts.wait_ns,
+        user_regs: sample.user_regs,
+        user_stack: sample.user_stack[..stack_len].to_vec(),
+    });
+
+    0
+}
+
 pub struct Profiler<'a> {
     pub perf_stack_map: StackMap,
     pub total_events: Rc<RefCell<u64>>,
     pub total_ns: Rc<RefCell<u64>>,
+    pub dwarf_samples: DwarfSamples,
 
     ringbuf: Option<RingBuffer<'a>>,
     pefds: Option<Vec<i32>>,
     links: Option<Vec<libbpf_rs::Link>>,
     cpus_to_profile: Option<Vec<u32>>,
+    dwarf: bool,
 }
 
 impl<'a> Profiler<'a> {
@@ -136,10 +196,12 @@ impl<'a> Profiler<'a> {
             perf_stack_map: Rc::new(RefCell::new(HashMap::new())),
             total_events: Rc::new(RefCell::new(0)),
             total_ns: Rc::new(RefCell::new(0)),
+            dwarf_samples: Rc::new(RefCell::new(Vec::new())),
             ringbuf: None,
             pefds: None,
             links: None,
             cpus_to_profile,
+            dwarf: false,
         }
     }
     fn try_open_perf_events(
@@ -232,6 +294,7 @@ impl<'a> Profiler<'a> {
         offcpu: bool,
         tracepoint_name: Option<String>,
         kfunc: bool,
+        dwarf: bool,
     ) -> Result<(), anyhow::Error> {
         let map = self.perf_stack_map.clone();
         let events = self.total_events.clone();
@@ -268,11 +331,21 @@ impl<'a> Profiler<'a> {
 
         let mut builder = libbpf_rs::RingBufferBuilder::new();
 
-        builder
-            .add(&skel.maps.events, move |data| {
-                event_handler(&events, &ns, &map, data)
-            })
-            .unwrap();
+        self.dwarf = dwarf;
+        if dwarf {
+            let samples = self.dwarf_samples.clone();
+            builder
+                .add(&skel.maps.dwarf_events, move |data| {
+                    dwarf_event_handler(&events, &ns, &samples, data)
+                })
+                .unwrap();
+        } else {
+            builder
+                .add(&skel.maps.events, move |data| {
+                    event_handler(&events, &ns, &map, data)
+                })
+                .unwrap();
+        }
 
         self.ringbuf = Some(builder.build().unwrap());
         Ok(())
@@ -290,9 +363,92 @@ impl<'a> Profiler<'a> {
         self.ringbuf.take();
         self.pefds.take();
     }
+    /// Unwind deferred dwarf samples and merge into the perf_stack_map.
+    /// Deduplicates by (pid, RIP, RSP) — samples with the same user
+    /// register state produce the same unwind, so we only unwind each
+    /// unique state once.
+    pub fn unwind_dwarf_samples(&mut self) {
+        if !self.dwarf {
+            return;
+        }
+
+        let samples = self.dwarf_samples.borrow();
+        let total = *self.total_events.borrow();
+        let hit_threshold = std::cmp::max((total as f64 * 0.0025) as u64, 1);
+
+        // Group samples by (pid, RIP, RSP) — same user register state
+        // means same unwind result.  Accumulate hits and collect the
+        // kernel stacks + comms for each group.
+        struct DwarfGroup {
+            hits: u64,
+            wait_ns: u64,
+            pid: i32,
+            regs: [u64; 3],
+            stack: Vec<u8>,
+            // representative kernel stack + comms
+            kstack: [u64; BPF_MAX_STACK_DEPTH],
+            kstack_len: i16,
+            comms: HashSet<[u8; crate::skel::TASK_COMM_LEN]>,
+        }
+
+        let mut groups: HashMap<(i32, u64, u64), DwarfGroup> = HashMap::new();
+        for sample in samples.iter() {
+            let key = (sample.pid, sample.user_regs[0], sample.user_regs[1]);
+            let group = groups.entry(key).or_insert_with(|| DwarfGroup {
+                hits: 0,
+                wait_ns: 0,
+                pid: sample.pid,
+                regs: sample.user_regs,
+                stack: sample.user_stack.clone(),
+                kstack: sample.kstack,
+                kstack_len: sample.kstack_len,
+                comms: HashSet::new(),
+            });
+            group.hits += 1;
+            group.wait_ns += sample.wait_ns;
+            group.comms.insert(sample.comm);
+        }
+
+        // Only unwind groups above the threshold
+        let mut unwinder = DwarfUnwinder::new();
+        let mut map = self.perf_stack_map.borrow_mut();
+
+        for group in groups.values() {
+            if group.hits < hit_threshold {
+                continue;
+            }
+
+            let uframes = unwinder.unwind(
+                group.pid,
+                group.regs[0],
+                group.regs[1],
+                group.regs[2],
+                &group.stack,
+            );
+
+            let mut ustack = [0u64; BPF_MAX_STACK_DEPTH];
+            let ustack_len = uframes.len().min(BPF_MAX_STACK_DEPTH);
+            ustack[..ustack_len].copy_from_slice(&uframes[..ustack_len]);
+
+            let frame = ProfileFrame::new(
+                group.pid,
+                group.kstack,
+                group.kstack_len,
+                ustack,
+                ustack_len as i16,
+            );
+
+            let val = map.entry(frame).or_insert(StackCounter::new());
+            val.hits += group.hits;
+            val.total_ns += group.wait_ns;
+            val.comms.extend(&group.comms);
+        }
+    }
+
     pub fn reset_frames(&mut self) {
         let mut map = self.perf_stack_map.borrow_mut();
         map.clear();
+        self.dwarf_samples.borrow_mut().clear();
         *self.total_events.borrow_mut() = 0;
         *self.total_ns.borrow_mut() = 0;
     }
