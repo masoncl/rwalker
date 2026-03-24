@@ -520,6 +520,7 @@ fn print_call_chain(node: &CallTreeNode, total_events: u64, prefix: &str) {
 // showing all the paths that led to that function.
 struct LeafGroup {
     hits: u64,
+    total_ns: u64,
     best_offset: usize,
     best_offset_hits: u64,
     best_line_info: String,
@@ -544,13 +545,17 @@ fn print_perf_stacks(
     };
     let kernel_src = Source::from(kernel);
     let total_events = *profiler.total_events.borrow();
+    let total_ns = *profiler.total_ns.borrow();
+    let offcpu = options.offcpu > 0;
 
     if total_events == 0 {
         return;
     }
 
+    // In offcpu mode, weight by total blocked time; in on-CPU mode, by sample count
+    let total_weight = if offcpu { total_ns } else { total_events };
     let map = profiler.perf_stack_map.borrow();
-    let hit_threshold = std::cmp::max((total_events as f64 * 0.0025) as u64, 1);
+    let hit_threshold = std::cmp::max((total_weight as f64 * 0.0025) as u64, 1);
 
     // Phase 1: batch-symbolize all unique leaf addresses.
     // Kernel addresses (above 0xffff...) use the kernel source.
@@ -712,11 +717,16 @@ fn print_perf_stacks(
         let offset = leaf.map(|l| l.offset).unwrap_or(0);
         let line_info = leaf.map(|l| l.line_info.as_str()).unwrap_or("");
 
+        let weight = if offcpu {
+            counter.total_ns
+        } else {
+            counter.hits
+        };
         let entry = func_hits
             .entry(name.to_string())
             .or_insert((0, 0, 0, String::new()));
-        entry.0 += counter.hits;
-        if counter.hits > entry.2 {
+        entry.0 += weight;
+        if weight > entry.2 {
             entry.1 = offset;
             entry.2 = counter.hits;
             entry.3 = line_info.to_string();
@@ -766,8 +776,14 @@ fn print_perf_stacks(
         let offset = leaf.map(|l| l.offset).unwrap_or(0);
         let line_info = leaf.map(|l| l.line_info.as_str()).unwrap_or("");
 
+        let weight = if offcpu {
+            counter.total_ns
+        } else {
+            counter.hits
+        };
         let group = leaf_groups.entry(name.to_string()).or_insert(LeafGroup {
             hits: 0,
+            total_ns: 0,
             best_offset: 0,
             best_offset_hits: 0,
             best_line_info: String::new(),
@@ -775,10 +791,11 @@ fn print_perf_stacks(
             tree: CallTreeNode::new(),
         });
         group.hits += counter.hits;
+        group.total_ns += counter.total_ns;
         group.comms.extend(&counter.comms);
-        if counter.hits > group.best_offset_hits {
+        if weight > group.best_offset_hits {
             group.best_offset = offset;
-            group.best_offset_hits = counter.hits;
+            group.best_offset_hits = weight;
             group.best_line_info = line_info.to_string();
         }
     }
@@ -999,16 +1016,26 @@ fn print_perf_stacks(
         let group = leaf_groups.get_mut(name).unwrap();
 
         // Reverse: build tree from root (outermost caller) → leaf
+        let weight = if offcpu {
+            counter.total_ns
+        } else {
+            counter.hits
+        };
         let chain: Vec<ResolvedFrame> = frames.into_iter().rev().collect();
-        group.tree.insert(&chain, counter.hits);
+        group.tree.insert(&chain, weight);
     }
 
     // Sort by overhead, heaviest first
     let mut sorted: Vec<_> = leaf_groups.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.hits.cmp(&a.1.hits));
+    sorted.sort_by(|a, b| {
+        let aw = if offcpu { b.1.total_ns } else { b.1.hits };
+        let bw = if offcpu { a.1.total_ns } else { a.1.hits };
+        aw.cmp(&bw)
+    });
 
     for (leaf_name, group) in sorted.iter().take(20) {
-        let pct = (group.hits as f64 / total_events as f64) * 100.0;
+        let group_weight = if offcpu { group.total_ns } else { group.hits };
+        let pct = (group_weight as f64 / total_weight as f64) * 100.0;
         if pct < 0.25 {
             continue;
         }
@@ -1040,9 +1067,17 @@ fn print_perf_stacks(
         };
 
         println!();
-        println!(">>> {:.2}%  {}  Comms: {}", pct, leaf_display, comms);
+        if offcpu {
+            let ms = group.total_ns as f64 / 1_000_000.0;
+            println!(
+                ">>> {:.2}% ({:.1}ms)  {}  Comms: {}",
+                pct, ms, leaf_display, comms
+            );
+        } else {
+            println!(">>> {:.2}%  {}  Comms: {}", pct, leaf_display, comms);
+        }
         println!("            |");
-        print_call_chain(&group.tree, total_events, "            ");
+        print_call_chain(&group.tree, total_weight, "            ");
     }
 }
 
@@ -1090,6 +1125,9 @@ pub struct Options {
     /// include user-space stacks in profiling (requires frame pointers in target binaries)
     #[clap(long, short = 'u', action = clap::ArgAction::SetTrue)]
     user: bool,
+    /// profile off-CPU (blocked) time for this many seconds
+    #[clap(long, value_parser, default_value_t = 0)]
+    offcpu: i32,
 }
 
 fn main() -> Result<()> {
@@ -1105,6 +1143,13 @@ fn main() -> Result<()> {
 
     // Load BPF JIT symbols from /proc/kallsyms for resolving BPF program addresses
     let bpf_resolver = BpfKsymResolver::load();
+
+    // Control which BPF programs are loaded
+    if options.offcpu > 0 {
+        open_skel.progs.profile.set_autoload(false);
+    } else {
+        open_skel.progs.offcpu_switch.set_autoload(false);
+    }
 
     let rodata = open_skel.maps.rodata_data.as_mut().unwrap();
     if options.all {
@@ -1145,12 +1190,17 @@ fn main() -> Result<()> {
     let mut task_pid_map: HashMap<(i32, u64), Task> = HashMap::new();
 
     let mut profiler = None;
-    if options.profile > 0 {
+    let is_profiling = options.profile > 0 || options.offcpu > 0;
+    if is_profiling {
         profiler = Some(profile::Profiler::new(cpus_to_profile));
-        profiler
-            .as_mut()
-            .unwrap()
-            .setup(&skel, options.freq, options.sw_perf, options.user)?;
+        let offcpu = options.offcpu > 0;
+        profiler.as_mut().unwrap().setup(
+            &skel,
+            options.freq,
+            options.sw_perf,
+            options.user,
+            offcpu,
+        )?;
     }
 
     let mut loops = 0;
@@ -1160,7 +1210,7 @@ fn main() -> Result<()> {
         }
 
         let mut found = false;
-        if options.profile == 0 {
+        if !is_profiling {
             found = walk_tasks(
                 skel.links.get_task_stacks.as_ref().unwrap(),
                 &mut task_pid_map,
@@ -1168,7 +1218,12 @@ fn main() -> Result<()> {
                 &options,
             );
         } else {
-            let profile_duration = std::time::Duration::from_secs(options.profile as u64);
+            let duration_secs = if options.offcpu > 0 {
+                options.offcpu
+            } else {
+                options.profile
+            };
+            let profile_duration = std::time::Duration::from_secs(duration_secs as u64);
             let start = Instant::now();
             loop {
                 let elapsed = start.elapsed();
@@ -1195,12 +1250,12 @@ fn main() -> Result<()> {
         {
             break;
         }
-        if options.profile == 0 {
-            let sleep_time = options.interval as u64 - options.profile as u64;
+        if !is_profiling {
+            let sleep_time = options.interval as u64;
             std::thread::sleep(std::time::Duration::from_secs(sleep_time));
         }
     }
-    if options.profile > 0 {
+    if is_profiling {
         profiler.as_mut().unwrap().close();
     }
 

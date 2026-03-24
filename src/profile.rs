@@ -56,6 +56,7 @@ impl ProfileFrame {
 // For profiling, we just record the stacks
 pub struct StackCounter {
     pub hits: u64,
+    pub total_ns: u64,
     pub comms: HashSet<[u8; crate::skel::TASK_COMM_LEN]>,
 }
 
@@ -63,11 +64,13 @@ impl StackCounter {
     pub fn new() -> StackCounter {
         StackCounter {
             hits: 0,
+            total_ns: 0,
             comms: HashSet::new(),
         }
     }
-    pub fn add(&mut self, comm: [u8; crate::skel::TASK_COMM_LEN]) {
+    pub fn add(&mut self, comm: [u8; crate::skel::TASK_COMM_LEN], wait_ns: u64) {
         self.hits += 1;
+        self.total_ns += wait_ns;
         self.comms.insert(comm);
     }
 }
@@ -76,6 +79,7 @@ pub type StackMap = Rc<RefCell<HashMap<ProfileFrame, StackCounter>>>;
 
 fn event_handler(
     total_events: &Rc<RefCell<u64>>,
+    total_ns: &Rc<RefCell<u64>>,
     perf_stack_map: &StackMap,
     data: &[u8],
 ) -> ::std::os::raw::c_int {
@@ -107,16 +111,18 @@ fn event_handler(
     );
 
     *total_events.borrow_mut() += 1;
+    *total_ns.borrow_mut() += event.wait_ns;
 
     let mut map = perf_stack_map.borrow_mut();
     let val = map.entry(frame).or_insert(StackCounter::new());
-    val.add(event.comm);
+    val.add(event.comm, event.wait_ns);
     0
 }
 
 pub struct Profiler<'a> {
     pub perf_stack_map: StackMap,
     pub total_events: Rc<RefCell<u64>>,
+    pub total_ns: Rc<RefCell<u64>>,
 
     ringbuf: Option<RingBuffer<'a>>,
     pefds: Option<Vec<i32>>,
@@ -129,6 +135,7 @@ impl<'a> Profiler<'a> {
         Profiler {
             perf_stack_map: Rc::new(RefCell::new(HashMap::new())),
             total_events: Rc::new(RefCell::new(0)),
+            total_ns: Rc::new(RefCell::new(0)),
             ringbuf: None,
             pefds: None,
             links: None,
@@ -207,23 +214,29 @@ impl<'a> Profiler<'a> {
         freq: u64,
         force_sw: bool,
         user: bool,
+        offcpu: bool,
     ) -> Result<(), anyhow::Error> {
         let map = self.perf_stack_map.clone();
         let events = self.total_events.clone();
+        let ns = self.total_ns.clone();
 
-        self.pefds = Some(Profiler::<'a>::init_perf_monitor(
-            self, freq, force_sw, user,
-        )?);
-        self.links = Some(Profiler::<'a>::attach_perf_event(
-            self.pefds.as_ref().unwrap(),
-            &skel.progs.profile,
-        )?);
+        if !offcpu {
+            self.pefds = Some(Profiler::<'a>::init_perf_monitor(
+                self, freq, force_sw, user,
+            )?);
+            self.links = Some(Profiler::<'a>::attach_perf_event(
+                self.pefds.as_ref().unwrap(),
+                &skel.progs.profile,
+            )?);
+        }
+        // offcpu mode: the offcpu_switch program is attached via
+        // skel.attach() — we just need the ringbuf consumer here.
 
         let mut builder = libbpf_rs::RingBufferBuilder::new();
 
         builder
             .add(&skel.maps.events, move |data| {
-                event_handler(&events, &map, data)
+                event_handler(&events, &ns, &map, data)
             })
             .unwrap();
 
@@ -247,5 +260,6 @@ impl<'a> Profiler<'a> {
         let mut map = self.perf_stack_map.borrow_mut();
         map.clear();
         *self.total_events.borrow_mut() = 0;
+        *self.total_ns.borrow_mut() = 0;
     }
 }

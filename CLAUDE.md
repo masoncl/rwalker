@@ -23,6 +23,7 @@ Defined in `src/bpf/rwalker.bpf.c` and auto-generated into Rust. Shared between 
 Requires root (or `CAP_BPF` + `CAP_PERFMON`). No unit test suite — verify manually:
 
 - D-state walking: `sudo ./target/release/rwalker`
+- Off-CPU profiling: `sudo ./target/release/rwalker --offcpu 5`
 - Kernel profiling: `sudo ./target/release/rwalker -p 5`
 - User+kernel profiling: `sudo ./target/release/rwalker -p 5 -u` (requires frame pointers in target binaries)
 - Quick mode (skip DWARF): `sudo ./target/release/rwalker -p 5 -q`

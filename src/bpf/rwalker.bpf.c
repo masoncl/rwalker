@@ -27,6 +27,7 @@ struct {
 } events SEC(".maps");
 
 const volatile int iter_mode = 0;
+const volatile uint64_t offcpu_min_ns = 1000000; /* 1ms default threshold */
 
 #define BPF_MAX_STACK_DEPTH 127
 #define BPF_MAX_STACK_SIZE (BPF_MAX_STACK_DEPTH * sizeof(stackframe_t))
@@ -145,6 +146,106 @@ int get_task_stacks(struct bpf_iter__task *ctx)
 	bpf_probe_read_kernel_str(t->comm, TASK_COMM_LEN, task->comm);
 	bpf_seq_write(seq, t, sizeof(struct task_stack));
 
+	return 0;
+}
+
+/* Max user frames saved at switch-out for off-CPU profiling.
+ * Kept smaller than BPF_MAX_STACK_DEPTH to limit hash map memory.
+ */
+#define OFFCPU_MAX_USTACK 32
+#define OFFCPU_USTACK_SIZE (OFFCPU_MAX_USTACK * sizeof(stackframe_t))
+
+struct offcpu_val {
+	u64 timestamp;
+	pid_t tgid;            /* init-ns process ID (for symbolization) */
+	int16_t ustack_len;
+	stackframe_t ustack[OFFCPU_MAX_USTACK];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, u32);      /* keyed by kernel pid (tid) */
+	__type(value, struct offcpu_val);
+} offcpu_start SEC(".maps");
+
+SEC("tp_btf/sched_switch")
+int offcpu_switch(u64 *ctx)
+{
+	/* tp_btf/sched_switch args: bool preempt, struct task_struct *prev,
+	 *                           struct task_struct *next, unsigned int prev_state
+	 */
+	struct task_struct *prev = (struct task_struct *)ctx[1];
+	struct task_struct *next = (struct task_struct *)ctx[2];
+	u64 now = bpf_ktime_get_ns();
+	u32 prev_pid = prev->pid;
+	u32 next_pid = next->pid;
+
+	/* Record switch-out: capture timestamp and user stack from prev
+	 * while its mm is still active.
+	 */
+	if (prev_pid != 0) {
+		struct offcpu_val val = {};
+		int32_t res;
+
+		val.timestamp = now;
+		val.tgid = prev->tgid;
+
+		res = bpf_get_task_stack(prev, val.ustack,
+					OFFCPU_USTACK_SIZE, BPF_F_USER_STACK);
+		if (res < 0)
+			res = 0;
+		val.ustack_len = res / sizeof(stackframe_t);
+
+		bpf_map_update_elem(&offcpu_start, &prev_pid, &val, BPF_ANY);
+	}
+
+	/* On switch-in, compute off-CPU time for next */
+	if (next_pid == 0)
+		return 0;
+
+	struct offcpu_val *stored = bpf_map_lookup_elem(&offcpu_start, &next_pid);
+	if (!stored)
+		return 0;
+
+	u64 delta = now - stored->timestamp;
+
+	if (delta < offcpu_min_ns) {
+		bpf_map_delete_elem(&offcpu_start, &next_pid);
+		return 0;
+	}
+
+	struct task_stack *t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
+	if (!t) {
+		bpf_map_delete_elem(&offcpu_start, &next_pid);
+		return 0;
+	}
+
+	t->pid = stored->tgid;  /* init-ns process ID */
+	t->tgid = next_pid;     /* init-ns thread ID */
+	t->task_ptr = 0;
+	t->wait_ns = delta;
+	t->switch_count = 0;
+	t->state = 0;
+	t->cpu = bpf_get_smp_processor_id();
+
+	bpf_probe_read_kernel_str(t->comm, TASK_COMM_LEN, next->comm);
+
+	/* Kernel stack: captured fresh from next (its kernel stack is valid) */
+	t->kstack_len = write_task_stack(next, t->kstack, 0);
+
+	/* User stack: replay what we saved at switch-out time */
+	int16_t ulen = stored->ustack_len;
+	if (ulen > BPF_MAX_STACK_DEPTH)
+		ulen = BPF_MAX_STACK_DEPTH;
+	t->ustack_len = ulen;
+	/* bpf_probe_read_kernel for the stored ustack */
+	if (ulen > 0)
+		bpf_probe_read_kernel(t->ustack, ulen * sizeof(stackframe_t),
+				      stored->ustack);
+
+	bpf_map_delete_elem(&offcpu_start, &next_pid);
+	bpf_ringbuf_submit(t, 0);
 	return 0;
 }
 
