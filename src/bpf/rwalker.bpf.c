@@ -32,7 +32,7 @@ const volatile int dwarf_mode = 0;
 
 #define BPF_MAX_STACK_DEPTH 127
 #define BPF_MAX_STACK_SIZE (BPF_MAX_STACK_DEPTH * sizeof(stackframe_t))
-#define DWARF_STACK_SIZE 8192
+#define DWARF_STACK_SIZE 32768 /* 32KB to capture deep user stacks */
 
 struct task_stack {
 	pid_t pid;

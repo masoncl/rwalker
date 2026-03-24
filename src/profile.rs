@@ -17,7 +17,7 @@ use anyhow::Context;
 use crate::skel::BPF_MAX_STACK_DEPTH;
 use crate::syscall;
 
-const DWARF_STACK_SIZE: usize = 8192;
+const DWARF_STACK_SIZE: usize = 32768;
 
 /// Layout must match struct dwarf_sample in rwalker.bpf.c
 #[repr(C)]
@@ -407,11 +407,15 @@ impl<'a> Profiler<'a> {
             group.comms.insert(sample.comm);
         }
 
-        // Only unwind groups above the threshold
+        // Sort by hits (heaviest first), cap at 500 unwinds
+        let mut sorted_groups: Vec<_> = groups.values().collect();
+        sorted_groups.sort_by(|a, b| b.hits.cmp(&a.hits));
+        sorted_groups.truncate(500);
+
         let mut unwinder = DwarfUnwinder::new();
         let mut map = self.perf_stack_map.borrow_mut();
 
-        for group in groups.values() {
+        for group in sorted_groups {
             let uframes = unwinder.unwind(
                 group.pid,
                 group.regs[0],

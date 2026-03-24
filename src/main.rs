@@ -695,6 +695,32 @@ fn print_perf_stacks(
         }
     }
 
+    // BPF overhead filter — used in phase 2 leaf lookup and phase 4c display
+    let is_bpf_overhead = |name: &str| -> bool {
+        name.starts_with("__bpf_get_stack")
+            || name.starts_with("bpf_get_stack")
+            || name.starts_with("__bpf_get_task_stack")
+            || name.starts_with("bpf_prog_")
+            || name.starts_with("bpf_trampoline_")
+            || name.starts_with("bpf_trace_run")
+    };
+
+    // Helper: find the real leaf addr by skipping BPF overhead frames
+    let find_real_leaf = |frame: &profile::ProfileFrame| -> u64 {
+        for addr in frame.kframe.iter() {
+            if let Some(sym) = leaf_sym_map.get(addr) {
+                if !is_bpf_overhead(&sym.name) {
+                    return *addr;
+                }
+            } else {
+                // Unknown address — not BPF overhead, use it
+                return *addr;
+            }
+        }
+        // All kernel frames are BPF overhead — fall back to user leaf
+        frame.uframe.first().copied().unwrap_or(0)
+    };
+
     // Phase 2: aggregate hits by leaf function NAME.  Track the hottest
     // offset within each function.  Filter by -c comm regex if set.
     let comm_re = if !options.command.is_empty() {
@@ -712,7 +738,10 @@ fn print_perf_stacks(
             }
         }
 
-        let leaf_addr = frame.leaf_addr();
+        let leaf_addr = find_real_leaf(frame);
+        if leaf_addr == 0 {
+            continue;
+        }
         let leaf = leaf_sym_map.get(&leaf_addr);
         let name = leaf.map(|l| l.name.as_str()).unwrap_or("<no-symbol>");
         let offset = leaf.map(|l| l.offset).unwrap_or(0);
@@ -743,7 +772,7 @@ fn print_perf_stacks(
 
     if options.user {
         for (frame, _) in map.iter() {
-            let leaf_addr = frame.leaf_addr();
+            let leaf_addr = find_real_leaf(frame);
             let name = leaf_sym_map
                 .get(&leaf_addr)
                 .map(|l| l.name.as_str())
@@ -768,7 +797,10 @@ fn print_perf_stacks(
                 continue;
             }
         }
-        let leaf_addr = frame.leaf_addr();
+        let leaf_addr = find_real_leaf(frame);
+        if leaf_addr == 0 {
+            continue;
+        }
         let leaf = leaf_sym_map.get(&leaf_addr);
         let name = leaf.map(|l| l.name.as_str()).unwrap_or("<no-symbol>");
         if !surviving_funcs.contains(name) {
@@ -813,7 +845,7 @@ fn print_perf_stacks(
                 continue;
             }
         }
-        let leaf_addr = frame.leaf_addr();
+        let leaf_addr = find_real_leaf(frame);
         let name = leaf_sym_map
             .get(&leaf_addr)
             .map(|l| l.name.as_str())
@@ -953,7 +985,7 @@ fn print_perf_stacks(
                 continue;
             }
         }
-        let leaf_addr = frame.leaf_addr();
+        let leaf_addr = find_real_leaf(frame);
         let name = leaf_sym_map
             .get(&leaf_addr)
             .map(|l| l.name.as_str())
@@ -962,7 +994,8 @@ fn print_perf_stacks(
             continue;
         }
 
-        // Resolve kernel frames from cache
+        // Resolve kernel frames from cache, stripping BPF overhead
+        // from the leaf end
         let kframes: Vec<ResolvedFrame> = frame
             .kframe
             .iter()
@@ -973,6 +1006,7 @@ fn print_perf_stacks(
                     line_info: String::new(),
                 })
             })
+            .skip_while(|f| is_bpf_overhead(&f.name))
             .collect();
 
         // Resolve user frames from cache
@@ -1034,12 +1068,22 @@ fn print_perf_stacks(
         aw.cmp(&bw)
     });
 
-    for (leaf_name, group) in sorted.iter().take(20) {
+    let adjusted_total = total_weight;
+
+    let mut displayed = 0;
+    for (leaf_name, group) in sorted.iter() {
+        if is_bpf_overhead(leaf_name) {
+            continue;
+        }
+        if displayed >= 20 {
+            break;
+        }
         let group_weight = if offcpu { group.total_ns } else { group.hits };
-        let pct = (group_weight as f64 / total_weight as f64) * 100.0;
+        let pct = (group_weight as f64 / adjusted_total as f64) * 100.0;
         if pct < 0.25 {
             continue;
         }
+        displayed += 1;
 
         let mut comms: String = group
             .comms
@@ -1078,7 +1122,7 @@ fn print_perf_stacks(
             println!(">>> {:.2}%  {}  Comms: {}", pct, leaf_display, comms);
         }
         println!("            |");
-        print_call_chain(&group.tree, total_weight, "            ");
+        print_call_chain(&group.tree, adjusted_total, "            ");
     }
 }
 
