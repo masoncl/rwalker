@@ -1,7 +1,9 @@
 use anyhow::Result;
 use blazesym::symbolize;
 use blazesym::symbolize::source::Kernel;
+use blazesym::symbolize::source::Process;
 use blazesym::symbolize::source::Source;
+use blazesym::Pid;
 use chrono::Local;
 use clap::Parser;
 use libbpf_rs::skel::OpenSkel as _;
@@ -398,84 +400,11 @@ fn __comm_to_str(comm: &[u8; crate::skel::TASK_COMM_LEN]) -> String {
 }
 
 // Resolved frame: function name + offset within the function.
+#[derive(Clone)]
 struct ResolvedFrame {
     name: String,
     offset: usize,
     line_info: String, // pre-formatted "file.c:123" or ""
-}
-
-// Resolve a raw address stack to function names + offsets for grouping.
-// Only extracts the primary (non-inlined) symbol per address.
-// Uses the BPF ksym resolver for addresses in the BPF JIT region.
-fn symbolize_to_frames(
-    stack: &[u64],
-    src: &Source<'_>,
-    symbolizer: &symbolize::Symbolizer,
-    bpf_resolver: &BpfKsymResolver,
-) -> Vec<ResolvedFrame> {
-    if stack.is_empty() {
-        return Vec::new();
-    }
-
-    let syms = match symbolizer.symbolize(src, symbolize::Input::AbsAddr(stack)) {
-        Ok(syms) => syms,
-        Err(_) => {
-            return stack
-                .iter()
-                .map(|a| ResolvedFrame {
-                    name: format!("{a:#x}"),
-                    offset: 0,
-                    line_info: String::new(),
-                })
-                .collect()
-        }
-    };
-
-    stack
-        .iter()
-        .copied()
-        .zip(syms)
-        .map(|(addr, sym)| {
-            // Check BPF JIT resolver first for this address
-            if let Some((bpf_name, bpf_offset)) = bpf_resolver.resolve(addr) {
-                return ResolvedFrame {
-                    name: bpf_name.to_string(),
-                    offset: bpf_offset,
-                    line_info: String::new(),
-                };
-            }
-
-            match sym {
-                symbolize::Symbolized::Sym(s) => {
-                    let line_info = s
-                        .code_info
-                        .as_ref()
-                        .map(|ci| {
-                            let path = ci.to_path();
-                            let file = path
-                                .file_name()
-                                .map(|f| f.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            match ci.line {
-                                Some(line) => format!("{file}:{line}"),
-                                None => file,
-                            }
-                        })
-                        .unwrap_or_default();
-                    ResolvedFrame {
-                        name: s.name.to_string(),
-                        offset: s.offset,
-                        line_info,
-                    }
-                }
-                symbolize::Symbolized::Unknown(_) => ResolvedFrame {
-                    name: "<no-symbol>".to_string(),
-                    offset: 0,
-                    line_info: String::new(),
-                },
-            }
-        })
-        .collect()
 }
 
 // Call chain tree node for perf-report-style grouping.
@@ -591,14 +520,18 @@ fn print_call_chain(node: &CallTreeNode, total_events: u64, prefix: &str) {
 // showing all the paths that led to that function.
 struct LeafGroup {
     hits: u64,
+    best_offset: usize,
+    best_offset_hits: u64,
+    best_line_info: String,
     comms: HashSet<[u8; crate::skel::TASK_COMM_LEN]>,
     tree: CallTreeNode,
 }
 
 // Print profiling results in perf-report style:
-// 1. Group all samples by their leaf function (where CPU was executing)
-// 2. For each leaf, build a tree of call chains from root to leaf
-// 3. Print with branching where callers diverge, ordered by overhead
+// 1. Symbolize only leaf addresses (cheap, kernel source) to group by function
+// 2. Filter groups below 0.25% threshold
+// 3. Symbolize full stacks only for surviving groups
+// 4. Print with branching where callers diverge, ordered by overhead
 fn print_perf_stacks(
     profiler: &mut profile::Profiler,
     symbolizer: &symbolize::Symbolizer,
@@ -609,32 +542,461 @@ fn print_perf_stacks(
         debug_syms: !options.quick,
         ..Default::default()
     };
-    let src = Source::from(kernel);
+    let kernel_src = Source::from(kernel);
     let total_events = *profiler.total_events.borrow();
 
     if total_events == 0 {
         return;
     }
 
-    // Group by leaf function, building call chain trees
-    let mut leaf_groups: HashMap<String, LeafGroup> = HashMap::new();
     let map = profiler.perf_stack_map.borrow();
+    let hit_threshold = std::cmp::max((total_events as f64 * 0.0025) as u64, 1);
 
-    for (frame, counter) in map.iter() {
-        let frames = symbolize_to_frames(&frame.frame, &src, symbolizer, bpf_resolver);
-        if frames.is_empty() {
+    // Phase 1: batch-symbolize all unique leaf addresses.
+    // Kernel addresses (above 0xffff...) use the kernel source.
+    // User addresses use per-pid Process sources.
+    let is_kernel_addr = |a: u64| a >= 0xffff_0000_0000_0000;
+
+    let mut kernel_leaf_addrs: Vec<u64> = map
+        .keys()
+        .map(|f| f.leaf_addr())
+        .filter(|a| *a != 0 && is_kernel_addr(*a))
+        .collect();
+    kernel_leaf_addrs.sort_unstable();
+    kernel_leaf_addrs.dedup();
+
+    let leaf_syms = symbolizer
+        .symbolize(&kernel_src, symbolize::Input::AbsAddr(&kernel_leaf_addrs))
+        .unwrap_or_default();
+
+    struct LeafSym {
+        name: String,
+        offset: usize,
+        line_info: String,
+    }
+
+    let mut leaf_sym_map: HashMap<u64, LeafSym> = HashMap::new();
+    for (addr, sym) in kernel_leaf_addrs.iter().copied().zip(leaf_syms) {
+        // Check BPF JIT resolver first
+        if let Some((bpf_name, bpf_offset)) = bpf_resolver.resolve(addr) {
+            leaf_sym_map.insert(
+                addr,
+                LeafSym {
+                    name: bpf_name.to_string(),
+                    offset: bpf_offset,
+                    line_info: String::new(),
+                },
+            );
             continue;
         }
+        match sym {
+            symbolize::Symbolized::Sym(s) => {
+                let line_info = s
+                    .code_info
+                    .as_ref()
+                    .map(|ci| {
+                        let path = ci.to_path();
+                        let file = path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        match ci.line {
+                            Some(line) => format!("{file}:{line}"),
+                            None => file,
+                        }
+                    })
+                    .unwrap_or_default();
+                leaf_sym_map.insert(
+                    addr,
+                    LeafSym {
+                        name: s.name.to_string(),
+                        offset: s.offset,
+                        line_info,
+                    },
+                );
+            }
+            symbolize::Symbolized::Unknown(_) => {
+                leaf_sym_map.insert(
+                    addr,
+                    LeafSym {
+                        name: "<no-symbol>".to_string(),
+                        offset: 0,
+                        line_info: String::new(),
+                    },
+                );
+            }
+        }
+    }
 
-        // frames[0] is the leaf (self) function, frames[last] is the root
-        let leaf = frames[0].name.clone();
-        let group = leaf_groups.entry(leaf).or_insert(LeafGroup {
+    // Process sources are built incrementally — phase 1b adds pids for
+    // user-leaf samples, phase 3 adds remaining pids for surviving groups.
+    let mut process_sources: HashMap<i32, Source<'_>> = HashMap::new();
+
+    // Phase 1b: symbolize user-leaf addresses (samples that fired in
+    // user mode with no kernel stack).  These need per-pid Process sources.
+    if options.user {
+        // Collect (pid, addr) pairs for user-leaf samples
+        let mut user_leaf_by_pid: HashMap<i32, Vec<u64>> = HashMap::new();
+        for frame in map.keys() {
+            let leaf = frame.leaf_addr();
+            if leaf != 0 && !is_kernel_addr(leaf) && frame.pid > 0 {
+                user_leaf_by_pid.entry(frame.pid).or_default().push(leaf);
+            }
+        }
+        for (pid, addrs) in user_leaf_by_pid.iter_mut() {
+            addrs.sort_unstable();
+            addrs.dedup();
+            let proc_src = process_sources.entry(*pid).or_insert_with(|| {
+                let mut proc = Process::new(Pid::from(*pid as u32));
+                proc.debug_syms = !options.quick;
+                Source::from(proc)
+            });
+            let syms = symbolizer
+                .symbolize(proc_src, symbolize::Input::AbsAddr(addrs))
+                .unwrap_or_default();
+            for (addr, sym) in addrs.iter().copied().zip(syms) {
+                let resolved = match sym {
+                    symbolize::Symbolized::Sym(s) => {
+                        let line_info = s
+                            .code_info
+                            .as_ref()
+                            .map(|ci| {
+                                let path = ci.to_path();
+                                let file = path
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                match ci.line {
+                                    Some(line) => format!("{file}:{line}"),
+                                    None => file,
+                                }
+                            })
+                            .unwrap_or_default();
+                        LeafSym {
+                            name: s.name.to_string(),
+                            offset: s.offset,
+                            line_info,
+                        }
+                    }
+                    symbolize::Symbolized::Unknown(_) => LeafSym {
+                        name: "<no-symbol>".to_string(),
+                        offset: 0,
+                        line_info: String::new(),
+                    },
+                };
+                leaf_sym_map.insert(addr, resolved);
+            }
+        }
+    }
+
+    // Phase 2: aggregate hits by leaf function NAME.  Track the hottest
+    // offset within each function.  Filter by -c comm regex if set.
+    let comm_re = if !options.command.is_empty() {
+        Some(Regex::new(&options.command).unwrap())
+    } else {
+        None
+    };
+
+    let mut func_hits: HashMap<String, (u64, usize, u64, String)> = HashMap::new();
+    for (frame, counter) in map.iter() {
+        // Skip entries that don't match the -c filter
+        if let Some(ref re) = comm_re {
+            if !counter.comms.iter().any(|c| re.is_match(&__comm_to_str(c))) {
+                continue;
+            }
+        }
+
+        let leaf_addr = frame.leaf_addr();
+        let leaf = leaf_sym_map.get(&leaf_addr);
+        let name = leaf.map(|l| l.name.as_str()).unwrap_or("<no-symbol>");
+        let offset = leaf.map(|l| l.offset).unwrap_or(0);
+        let line_info = leaf.map(|l| l.line_info.as_str()).unwrap_or("");
+
+        let entry = func_hits
+            .entry(name.to_string())
+            .or_insert((0, 0, 0, String::new()));
+        entry.0 += counter.hits;
+        if counter.hits > entry.2 {
+            entry.1 = offset;
+            entry.2 = counter.hits;
+            entry.3 = line_info.to_string();
+        }
+    }
+
+    // Phase 3: build Process sources only for pids in surviving groups
+    let surviving_funcs: HashSet<&str> = func_hits
+        .iter()
+        .filter(|(_, (hits, _, _, _))| *hits >= hit_threshold)
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    if options.user {
+        for (frame, _) in map.iter() {
+            let leaf_addr = frame.leaf_addr();
+            let name = leaf_sym_map
+                .get(&leaf_addr)
+                .map(|l| l.name.as_str())
+                .unwrap_or("<no-symbol>");
+            if surviving_funcs.contains(name) && !frame.uframe.is_empty() && frame.pid > 0 {
+                process_sources.entry(frame.pid).or_insert_with(|| {
+                    let mut proc = Process::new(Pid::from(frame.pid as u32));
+                    proc.debug_syms = !options.quick;
+                    Source::from(proc)
+                });
+            }
+        }
+    }
+
+    // Phase 4a: accumulate hits, comms, and best offset per leaf group
+    // using the already-resolved leaf symbols from phase 1 (no new
+    // symbolization).
+    let mut leaf_groups: HashMap<String, LeafGroup> = HashMap::new();
+    for (frame, counter) in map.iter() {
+        if let Some(ref re) = comm_re {
+            if !counter.comms.iter().any(|c| re.is_match(&__comm_to_str(c))) {
+                continue;
+            }
+        }
+        let leaf_addr = frame.leaf_addr();
+        let leaf = leaf_sym_map.get(&leaf_addr);
+        let name = leaf.map(|l| l.name.as_str()).unwrap_or("<no-symbol>");
+        if !surviving_funcs.contains(name) {
+            continue;
+        }
+        let offset = leaf.map(|l| l.offset).unwrap_or(0);
+        let line_info = leaf.map(|l| l.line_info.as_str()).unwrap_or("");
+
+        let group = leaf_groups.entry(name.to_string()).or_insert(LeafGroup {
             hits: 0,
+            best_offset: 0,
+            best_offset_hits: 0,
+            best_line_info: String::new(),
             comms: HashSet::new(),
             tree: CallTreeNode::new(),
         });
         group.hits += counter.hits;
         group.comms.extend(&counter.comms);
+        if counter.hits > group.best_offset_hits {
+            group.best_offset = offset;
+            group.best_offset_hits = counter.hits;
+            group.best_line_info = line_info.to_string();
+        }
+    }
+
+    // Phase 4b: collect ALL unique addresses from surviving stacks,
+    // then batch-symbolize them in one call per source.  This triggers
+    // blazesym's symtab sort once instead of incrementally per-stack.
+    let mut all_kernel_addrs: Vec<u64> = Vec::new();
+    let mut all_user_addrs: HashMap<i32, Vec<u64>> = HashMap::new();
+
+    for (frame, counter) in map.iter() {
+        if let Some(ref re) = comm_re {
+            if !counter.comms.iter().any(|c| re.is_match(&__comm_to_str(c))) {
+                continue;
+            }
+        }
+        let leaf_addr = frame.leaf_addr();
+        let name = leaf_sym_map
+            .get(&leaf_addr)
+            .map(|l| l.name.as_str())
+            .unwrap_or("<no-symbol>");
+        if !surviving_funcs.contains(name) {
+            continue;
+        }
+        all_kernel_addrs.extend_from_slice(&frame.kframe);
+        if options.user && !frame.uframe.is_empty() && frame.pid > 0 {
+            all_user_addrs
+                .entry(frame.pid)
+                .or_default()
+                .extend_from_slice(&frame.uframe);
+        }
+    }
+
+    // Deduplicate and batch-resolve all kernel addresses
+    all_kernel_addrs.sort_unstable();
+    all_kernel_addrs.dedup();
+    let mut kernel_cache: HashMap<u64, ResolvedFrame> = HashMap::new();
+    // Seed cache from phase 1 leaf results
+    for (addr, ls) in &leaf_sym_map {
+        kernel_cache.insert(
+            *addr,
+            ResolvedFrame {
+                name: ls.name.clone(),
+                offset: ls.offset,
+                line_info: ls.line_info.clone(),
+            },
+        );
+    }
+    // Resolve remaining kernel addresses not already in cache
+    let kernel_misses: Vec<u64> = all_kernel_addrs
+        .iter()
+        .copied()
+        .filter(|a| !kernel_cache.contains_key(a))
+        .collect();
+    if !kernel_misses.is_empty() {
+        let syms = symbolizer
+            .symbolize(&kernel_src, symbolize::Input::AbsAddr(&kernel_misses))
+            .unwrap_or_default();
+        for (addr, sym) in kernel_misses.iter().copied().zip(syms) {
+            if let Some((bpf_name, bpf_offset)) = bpf_resolver.resolve(addr) {
+                kernel_cache.insert(
+                    addr,
+                    ResolvedFrame {
+                        name: bpf_name.to_string(),
+                        offset: bpf_offset,
+                        line_info: String::new(),
+                    },
+                );
+                continue;
+            }
+            let frame = match sym {
+                symbolize::Symbolized::Sym(s) => {
+                    let line_info = s
+                        .code_info
+                        .as_ref()
+                        .map(|ci| {
+                            let path = ci.to_path();
+                            let file = path
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            match ci.line {
+                                Some(line) => format!("{file}:{line}"),
+                                None => file,
+                            }
+                        })
+                        .unwrap_or_default();
+                    ResolvedFrame {
+                        name: s.name.to_string(),
+                        offset: s.offset,
+                        line_info,
+                    }
+                }
+                symbolize::Symbolized::Unknown(_) => ResolvedFrame {
+                    name: "<no-symbol>".to_string(),
+                    offset: 0,
+                    line_info: String::new(),
+                },
+            };
+            kernel_cache.insert(addr, frame);
+        }
+    }
+
+    // Deduplicate and batch-resolve all user addresses per pid
+    let mut user_caches: HashMap<i32, HashMap<u64, ResolvedFrame>> = HashMap::new();
+    for (pid, addrs) in all_user_addrs.iter_mut() {
+        addrs.sort_unstable();
+        addrs.dedup();
+        if let Some(proc_src) = process_sources.get(pid) {
+            let ucache = user_caches.entry(*pid).or_default();
+            let syms = symbolizer
+                .symbolize(proc_src, symbolize::Input::AbsAddr(addrs))
+                .unwrap_or_default();
+            for (addr, sym) in addrs.iter().copied().zip(syms) {
+                let frame = match sym {
+                    symbolize::Symbolized::Sym(s) => {
+                        let line_info = s
+                            .code_info
+                            .as_ref()
+                            .map(|ci| {
+                                let path = ci.to_path();
+                                let file = path
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                match ci.line {
+                                    Some(line) => format!("{file}:{line}"),
+                                    None => file,
+                                }
+                            })
+                            .unwrap_or_default();
+                        ResolvedFrame {
+                            name: s.name.to_string(),
+                            offset: s.offset,
+                            line_info,
+                        }
+                    }
+                    symbolize::Symbolized::Unknown(_) => ResolvedFrame {
+                        name: "<no-symbol>".to_string(),
+                        offset: 0,
+                        line_info: String::new(),
+                    },
+                };
+                ucache.insert(addr, frame);
+            }
+        }
+    }
+
+    // Phase 4c: build the call chain trees from the fully-populated caches.
+    // No more blazesym calls — pure cache lookups.
+    for (frame, counter) in map.iter() {
+        if let Some(ref re) = comm_re {
+            if !counter.comms.iter().any(|c| re.is_match(&__comm_to_str(c))) {
+                continue;
+            }
+        }
+        let leaf_addr = frame.leaf_addr();
+        let name = leaf_sym_map
+            .get(&leaf_addr)
+            .map(|l| l.name.as_str())
+            .unwrap_or("<no-symbol>");
+        if !surviving_funcs.contains(name) {
+            continue;
+        }
+
+        // Resolve kernel frames from cache
+        let kframes: Vec<ResolvedFrame> = frame
+            .kframe
+            .iter()
+            .map(|a| {
+                kernel_cache.get(a).cloned().unwrap_or(ResolvedFrame {
+                    name: format!("{a:#x}"),
+                    offset: 0,
+                    line_info: String::new(),
+                })
+            })
+            .collect();
+
+        // Resolve user frames from cache
+        let mut uframes: Vec<ResolvedFrame> =
+            if options.user && !frame.uframe.is_empty() && frame.pid > 0 {
+                if let Some(ucache) = user_caches.get(&frame.pid) {
+                    frame
+                        .uframe
+                        .iter()
+                        .map(|a| {
+                            ucache.get(a).cloned().unwrap_or(ResolvedFrame {
+                                name: "<no-symbol>".to_string(),
+                                offset: 0,
+                                line_info: String::new(),
+                            })
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+        // Trim <no-symbol> runs from both ends of user stacks
+        if let Some(first_good) = uframes.iter().position(|f| f.name != "<no-symbol>") {
+            uframes.drain(..first_good);
+        }
+        while uframes.last().is_some_and(|f| f.name == "<no-symbol>") {
+            uframes.pop();
+        }
+
+        // Combined stack (leaf-first): kernel frames then user frames.
+        let mut frames: Vec<ResolvedFrame> = Vec::with_capacity(kframes.len() + uframes.len());
+        frames.extend(kframes);
+        frames.extend(uframes);
+
+        if frames.is_empty() {
+            continue;
+        }
+
+        let group = leaf_groups.get_mut(name).unwrap();
 
         // Reverse: build tree from root (outermost caller) → leaf
         let chain: Vec<ResolvedFrame> = frames.into_iter().rev().collect();
@@ -662,8 +1024,23 @@ fn print_perf_stacks(
         if group.comms.len() > 4 {
             comms.push_str(", ...");
         }
+
+        // Show the hottest offset in the leaf function
+        let leaf_display = if group.best_offset > 0 {
+            if group.best_line_info.is_empty() {
+                format!("{leaf_name}+{:#x}", group.best_offset)
+            } else {
+                format!(
+                    "{leaf_name}+{:#x} {}",
+                    group.best_offset, group.best_line_info
+                )
+            }
+        } else {
+            leaf_name.clone()
+        };
+
         println!();
-        println!(">>> {:.2}%  {}  Comms: {}", pct, leaf_name, comms);
+        println!(">>> {:.2}%  {}  Comms: {}", pct, leaf_display, comms);
         println!("            |");
         print_call_chain(&group.tree, total_events, "            ");
     }
@@ -710,6 +1087,9 @@ pub struct Options {
     /// force software CPU clock events instead of hardware PMU
     #[clap(long, action = clap::ArgAction::SetTrue)]
     sw_perf: bool,
+    /// include user-space stacks in profiling (requires frame pointers in target binaries)
+    #[clap(long, short = 'u', action = clap::ArgAction::SetTrue)]
+    user: bool,
 }
 
 fn main() -> Result<()> {
@@ -770,7 +1150,7 @@ fn main() -> Result<()> {
         profiler
             .as_mut()
             .unwrap()
-            .setup(&skel, options.freq, options.sw_perf)?;
+            .setup(&skel, options.freq, options.sw_perf, options.user)?;
     }
 
     let mut loops = 0;

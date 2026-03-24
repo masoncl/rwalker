@@ -23,7 +23,7 @@ enum {
 
 struct {
         __uint(type, BPF_MAP_TYPE_RINGBUF);
-        __uint(max_entries, 16 * 1024 * 1024);
+        __uint(max_entries, 32 * 1024 * 1024);
 } events SEC(".maps");
 
 const volatile int iter_mode = 0;
@@ -40,7 +40,9 @@ struct task_stack {
 	uint64_t switch_count;
 	int32_t state;
 	int16_t kstack_len;
+	int16_t ustack_len;
 	stackframe_t kstack[BPF_MAX_STACK_DEPTH];
+	stackframe_t ustack[BPF_MAX_STACK_DEPTH];
 	u8 comm[TASK_COMM_LEN];
 };
 
@@ -139,6 +141,7 @@ int get_task_stacks(struct bpf_iter__task *ctx)
 	t->cpu = BPF_CORE_READ(task, wake_cpu);
 
 	t->kstack_len = write_task_stack(task, t->kstack, 0);
+	t->ustack_len = 0;
 	bpf_probe_read_kernel_str(t->comm, TASK_COMM_LEN, task->comm);
 	bpf_seq_write(seq, t, sizeof(struct task_stack));
 
@@ -148,7 +151,9 @@ int get_task_stacks(struct bpf_iter__task *ctx)
 SEC("perf_event")
 int profile(void *ctx)
 {
-	int pid = bpf_get_current_pid_tgid() >> 32;
+	uint64_t pid_tgid = bpf_get_current_pid_tgid();
+	int tgid = pid_tgid >> 32;      /* userspace PID (process) */
+	int tid = pid_tgid & 0xffffffff; /* userspace TID (thread) */
 	int cpu_id = bpf_get_smp_processor_id();
 	struct task_stack *t;
 	struct task_struct *task;
@@ -166,8 +171,8 @@ int profile(void *ctx)
 	if (!t)
 		return 1;
 
-	t->pid = pid;
-	t->tgid = 0;
+	t->pid = tgid;
+	t->tgid = tid;
 	t->task_ptr = 0;
 	t->wait_ns = 0;
 	t->switch_count = 0;
@@ -180,8 +185,13 @@ int profile(void *ctx)
 	res = bpf_get_stack(ctx, t->kstack, BPF_MAX_STACK_SIZE, 0);
 	if (res < 0)
 		res = 0;
-
 	t->kstack_len = res / sizeof(stackframe_t);
+
+	res = bpf_get_stack(ctx, t->ustack, BPF_MAX_STACK_SIZE, BPF_F_USER_STACK);
+	if (res < 0)
+		res = 0;
+	t->ustack_len = res / sizeof(stackframe_t);
+
 	bpf_ringbuf_submit(t, 0);
 
 	return 0;

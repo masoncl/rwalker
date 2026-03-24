@@ -16,19 +16,40 @@ use anyhow::Context;
 use crate::skel::BPF_MAX_STACK_DEPTH;
 use crate::syscall;
 
-// Raw stack frame keyed by addresses only (not CPU).  The tree grouping
+// Raw stack frame keyed by addresses and pid.  The tree grouping
 // merges across CPUs by function name, so separating by CPU here would
-// just inflate the map.
+// just inflate the map.  pid is included because the same virtual address
+// in different processes maps to different functions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProfileFrame {
-    pub frame: Vec<u64>,
+    pub pid: i32,
+    pub kframe: Vec<u64>,
+    pub uframe: Vec<u64>,
 }
 
 impl ProfileFrame {
-    pub fn new(frame: [u64; BPF_MAX_STACK_DEPTH], frame_len: i16) -> Self {
+    pub fn new(
+        pid: i32,
+        kstack: [u64; BPF_MAX_STACK_DEPTH],
+        kstack_len: i16,
+        ustack: [u64; BPF_MAX_STACK_DEPTH],
+        ustack_len: i16,
+    ) -> Self {
         ProfileFrame {
-            frame: frame[..frame_len as usize].to_vec(),
+            pid,
+            kframe: kstack[..kstack_len as usize].to_vec(),
+            uframe: ustack[..ustack_len as usize].to_vec(),
         }
+    }
+
+    /// The innermost frame address (where the CPU was executing).
+    /// Kernel leaf if available, otherwise user leaf.
+    pub fn leaf_addr(&self) -> u64 {
+        self.kframe
+            .first()
+            .or(self.uframe.first())
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -69,11 +90,21 @@ fn event_handler(
 
     let event = unsafe { &*(data.as_ptr() as *const task_stack) };
 
-    if event.kstack_len <= 0 {
+    if event.kstack_len <= 0 && event.ustack_len <= 0 {
         return 0;
     }
 
-    let frame = ProfileFrame::new(event.kstack, event.kstack_len);
+    // Use event.pid (= kernel tgid = userspace PID) for process
+    // identification, not event.tgid (= kernel pid = thread ID).
+    // This ensures threads from the same process share one Process
+    // source and one /proc/<pid>/maps parse in blazesym.
+    let frame = ProfileFrame::new(
+        event.pid,
+        event.kstack,
+        event.kstack_len,
+        event.ustack,
+        event.ustack_len,
+    );
 
     *total_events.borrow_mut() += 1;
 
@@ -121,7 +152,12 @@ impl<'a> Profiler<'a> {
             .collect()
     }
 
-    fn init_perf_monitor(&self, freq: u64, force_sw: bool) -> Result<Vec<i32>, anyhow::Error> {
+    fn init_perf_monitor(
+        &self,
+        freq: u64,
+        force_sw: bool,
+        user: bool,
+    ) -> Result<Vec<i32>, anyhow::Error> {
         let nprocs = libbpf_rs::num_possible_cpus().unwrap();
         let mut attr = Box::new(unsafe { mem::zeroed::<syscall::perf_event_attr>() });
 
@@ -130,9 +166,10 @@ impl<'a> Profiler<'a> {
 
         attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
         attr.sample.sample_freq = freq;
-        attr.flags = syscall::PERF_ATTR_FLAG_FREQ
-            | syscall::PERF_ATTR_FLAG_EXCLUDE_USER
-            | syscall::PERF_ATTR_FLAG_EXCLUDE_GUEST;
+        attr.flags = syscall::PERF_ATTR_FLAG_FREQ | syscall::PERF_ATTR_FLAG_EXCLUDE_GUEST;
+        if !user {
+            attr.flags |= syscall::PERF_ATTR_FLAG_EXCLUDE_USER;
+        }
 
         if !force_sw {
             // Try hardware CPU cycles first (best accuracy)
@@ -169,11 +206,14 @@ impl<'a> Profiler<'a> {
         skel: &'a RwalkerSkel<'a>,
         freq: u64,
         force_sw: bool,
+        user: bool,
     ) -> Result<(), anyhow::Error> {
         let map = self.perf_stack_map.clone();
         let events = self.total_events.clone();
 
-        self.pefds = Some(Profiler::<'a>::init_perf_monitor(self, freq, force_sw)?);
+        self.pefds = Some(Profiler::<'a>::init_perf_monitor(
+            self, freq, force_sw, user,
+        )?);
         self.links = Some(Profiler::<'a>::attach_perf_event(
             self.pefds.as_ref().unwrap(),
             &skel.progs.profile,
