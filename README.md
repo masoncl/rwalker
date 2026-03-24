@@ -1,9 +1,10 @@
 # rwalker
 
-A BPF-based tool for diagnosing stuck tasks and CPU contention on Linux.
-rwalker uses BPF iterators to walk kernel task state and perf events to
-profile CPU usage, with symbolized kernel stack traces and perf-report
-style output.
+A BPF-based tool for diagnosing stuck tasks, CPU contention, and
+off-CPU latency on Linux.  rwalker uses BPF iterators to walk kernel
+task state, perf events to profile CPU usage, and sched_switch
+tracepoints to measure off-CPU (blocked) time — all with symbolized
+kernel and user stack traces in perf-report style output.
 
 ## Building
 
@@ -50,10 +51,36 @@ rwalker -p 5
 ```
 
 Profiles kernel CPU usage for 5 seconds using hardware perf events
-(CPU cycles at 4000 Hz, matching `perf record` defaults).  Userspace
-samples are excluded.  Output is grouped by leaf function (where the
-CPU was executing) with a call chain tree showing all paths that led
-there -- similar to `perf report --all-kernel`.
+(CPU cycles at 4000 Hz, matching `perf record` defaults).  Output is
+grouped by leaf function (where the CPU was executing) with a call
+chain tree showing all paths that led there — similar to
+`perf report --all-kernel`.
+
+Add `-u` to include user-space stacks (requires frame pointers in
+target binaries):
+
+```
+rwalker -p 5 -u
+```
+
+### Off-CPU profiling
+
+```
+rwalker --offcpu 5
+```
+
+Measures time tasks spend blocked (waiting on I/O, locks, sleep) for
+5 seconds.  Attaches to `sched_switch` to capture the kernel stack at
+switch-out time, then measures the delta when the task resumes.
+Events shorter than 1ms are filtered in BPF.  Output shows percentage
+of total off-CPU time and absolute milliseconds per leaf function.
+
+Add `-u` to include user-space stacks (captured at switch-out while
+the process mm is still active):
+
+```
+rwalker --offcpu 5 -u
+```
 
 ### Options
 
@@ -71,8 +98,11 @@ Options:
   -i, --interval <N>   Re-read task stacks every N seconds [default: 0]
   -C, --count <N>      Stop after N iterations in interval mode [default: 0]
   -p, --profile <N>    Profile CPU usage for N seconds [default: 0]
+      --offcpu <N>     Profile off-CPU (blocked) time for N seconds [default: 0]
+  -u, --user           Include user-space stacks (requires frame pointers)
   -P, --cpus <CPUS>    CPU mask for profiling (e.g. "0-3" or "1,4,7")
   -f, --freq <N>       Sampling frequency in Hz [default: 4000]
+      --sw-perf        Force software CPU clock events instead of hardware PMU
   -h, --help           Print help
 ```
 
@@ -98,9 +128,24 @@ Show all tasks matching "btrfs" with full addresses:
 rwalker -a -c btrfs -v
 ```
 
+Profile with user-space stacks, filtered to a specific process:
+```
+rwalker -p 5 -u -c myapp
+```
+
+Find what's blocking a process:
+```
+rwalker --offcpu 5 -u -c myapp
+```
+
 Monitor D-state tasks every 5 seconds, 20 iterations:
 ```
 rwalker -i 5 -C 20
+```
+
+Profile in a VM without hardware PMU:
+```
+rwalker -p 5 --sw-perf
 ```
 
 ## Output
@@ -144,7 +189,7 @@ instruction offset that collected the most samples.
 ```
 src/
   bpf/
-    rwalker.bpf.c   BPF programs (task iterator + perf_event profiler)
+    rwalker.bpf.c   BPF programs (task iterator, perf_event profiler, sched_switch off-CPU)
     vmlinux.h        Kernel type definitions for BPF CO-RE
   main.rs            CLI, task walking, profiling output, call tree display
   profile.rs         Profiler: perf event setup, ringbuf consumption, stack aggregation
@@ -165,21 +210,33 @@ task state field, `sched_info.run_delay` with field existence check).
 
 **`profile`** (perf_event) -- Attached to hardware CPU cycle perf events.
 Skips idle tasks by comparing against the per-CPU runqueue idle task.
-Captures kernel stacks via `bpf_get_stack()` and submits through a 16MB
-ringbuf.
+Captures kernel and user stacks via `bpf_get_stack()` and submits
+through a 32MB ringbuf.  Uses BTF task_struct reads for init-namespace
+PIDs (container-safe).
+
+**`offcpu_switch`** (tp_btf/sched_switch) -- Measures off-CPU time by
+recording switch-out timestamps and user stacks in a per-pid hash map,
+then computing the delta at switch-in.  Events below 1ms are filtered
+in BPF.  Kernel stacks are captured fresh at switch-in; user stacks
+are replayed from switch-out (when the process mm was still active).
 
 ### Rust components
 
 **Profiler** manages perf event lifecycle: opens perf events per CPU,
-attaches the BPF program, builds a ringbuf consumer.  Raw stacks are
-aggregated in a `HashMap<ProfileFrame, StackCounter>` keyed by
-(addresses, cpu).
+attaches the BPF program, builds a ringbuf consumer.  Used for both
+on-CPU and off-CPU modes.  Raw stacks are aggregated in a
+`HashMap<ProfileFrame, StackCounter>` keyed by (pid, addresses).
 
 **Call tree display** symbolizes raw stacks to function names, groups by
 leaf function, builds a `CallTreeNode` trie from root caller to leaf,
 and prints with branching percentages at divergence points.  Each node
 tracks per-offset hit counts to display the most common instruction
-offset and source location.
+offset and source location.  Symbolization is batched and cached:
+leaf addresses are resolved first to filter by 0.25% threshold before
+full-stack symbolization, and a per-address cache avoids redundant
+blazesym calls.  User stacks from frame-pointer-less binaries are
+trimmed.  `.gnu_debugdata` (MiniDebugInfo) is supported via the
+blazesym xz feature.
 
 ## Dependencies
 
