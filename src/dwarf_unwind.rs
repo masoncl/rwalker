@@ -25,6 +25,9 @@ struct EhFrameCache {
     eh_frame_len: usize,
     eh_frame_vaddr: u64,
     text_vaddr: u64,
+    /// p_vaddr - p_offset of the lowest PT_LOAD segment.
+    /// For PIE binaries, the runtime load address = vma.start - vma.offset + elf_load_bias.
+    elf_load_bias: u64,
 }
 
 /// Per-pid unwinder with VMA and ELF caches
@@ -79,6 +82,7 @@ impl DwarfUnwinder {
         let mut cur_rip = rip;
         let mut cur_rsp = rsp;
         let mut cur_rbp = rbp;
+        let debug = std::env::var("RWALKER_DWARF_DEBUG").is_ok();
 
         // Make sure VMAs are loaded
         self.vma_cache
@@ -87,25 +91,57 @@ impl DwarfUnwinder {
 
         frames.push(cur_rip);
 
-        for _ in 0..MAX_FRAMES - 1 {
-            // Find the VMA for current RIP
-            let vmas = self.vma_cache.get(&pid).unwrap();
-            let vma = match Self::find_vma(vmas, cur_rip) {
-                Some(v) => v,
-                None => break,
+        for frame_idx in 0..MAX_FRAMES - 1 {
+            // Find the VMA for current RIP — extract what we need to
+            // avoid holding an immutable borrow on self.vma_cache
+            let (path, load_base, vma_start, vma_end, vma_offset) = {
+                let vmas = self.vma_cache.get(&pid).unwrap();
+                match Self::find_vma(vmas, cur_rip) {
+                    Some(v) => (v.path.clone(), v.start - v.offset, v.start, v.end, v.offset),
+                    None => {
+                        if debug {
+                            eprintln!("  frame {frame_idx}: rip={cur_rip:#x} — no VMA found");
+                        }
+                        break;
+                    }
+                }
             };
-
-            let path = vma.path.clone();
-            let load_base = vma.start - vma.offset;
 
             // Get .eh_frame for this binary
             let eh_cache = match self.get_eh_frame(&path) {
                 Some(c) => c,
-                None => break,
+                None => {
+                    if debug {
+                        eprintln!(
+                            "  frame {frame_idx}: rip={cur_rip:#x} path={} — no .eh_frame",
+                            path.display()
+                        );
+                    }
+                    break;
+                }
             };
 
-            // The address relative to the ELF's load address
-            let relative_rip = cur_rip - load_base;
+            // Convert runtime address to ELF virtual address.
+            // Runtime addr = (load_base - elf_load_bias) + elf_vaddr
+            // So: elf_vaddr = runtime_addr - load_base + elf_load_bias
+            let relative_rip = cur_rip - load_base + eh_cache.elf_load_bias;
+
+            if debug && frame_idx == 0 {
+                eprintln!(
+                    "dwarf unwind pid={pid} rip={cur_rip:#x} rsp={cur_rsp:#x} rbp={cur_rbp:#x}"
+                );
+                eprintln!(
+                    "  vma: {:#x}-{:#x} offset={:#x} path={}",
+                    vma_start,
+                    vma_end,
+                    vma_offset,
+                    path.display()
+                );
+                eprintln!(
+                    "  load_base={load_base:#x} relative_rip={relative_rip:#x} eh_frame_vaddr={:#x} text_vaddr={:#x}",
+                    eh_cache.eh_frame_vaddr, eh_cache.text_vaddr
+                );
+            }
 
             // Parse .eh_frame
             let eh_frame_data = &eh_cache.mmap
@@ -126,7 +162,14 @@ impl DwarfUnwinder {
                 EhFrame::cie_from_offset,
             ) {
                 Ok(row) => row,
-                Err(_) => break,
+                Err(e) => {
+                    if debug {
+                        eprintln!(
+                            "  frame {frame_idx}: rip={cur_rip:#x} relative={relative_rip:#x} — FDE lookup failed: {e}"
+                        );
+                    }
+                    break;
+                }
             };
 
             // Evaluate CFA
@@ -273,7 +316,10 @@ fn load_eh_frame(path: &PathBuf) -> io::Result<EhFrameCache> {
     }
 
     // ELF64 header
+    let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
     let e_shoff = u64::from_le_bytes(data[40..48].try_into().unwrap()) as usize;
+    let e_phentsize = u16::from_le_bytes(data[54..56].try_into().unwrap()) as usize;
+    let e_phnum = u16::from_le_bytes(data[56..58].try_into().unwrap()) as usize;
     let e_shentsize = u16::from_le_bytes(data[58..60].try_into().unwrap()) as usize;
     let e_shnum = u16::from_le_bytes(data[60..62].try_into().unwrap()) as usize;
     let e_shstrndx = u16::from_le_bytes(data[62..64].try_into().unwrap()) as usize;
@@ -298,6 +344,29 @@ fn load_eh_frame(path: &PathBuf) -> io::Result<EhFrameCache> {
             .unwrap(),
     ) as usize;
     let shstrtab = &data[shstrtab_off..shstrtab_off + shstrtab_size];
+
+    // Find the lowest PT_LOAD segment to compute the ELF load bias.
+    // PT_LOAD = 1.  For PIE, the first LOAD has p_vaddr=0 p_offset=0
+    // so bias=0.  For non-PIE or multi-segment layouts, bias = p_vaddr - p_offset
+    // of the first LOAD segment.
+    let mut elf_load_bias = 0u64;
+    let mut found_load = false;
+    for i in 0..e_phnum {
+        let ph = e_phoff + i * e_phentsize;
+        if ph + 56 > data.len() {
+            break;
+        }
+        let p_type = u32::from_le_bytes(data[ph..ph + 4].try_into().unwrap());
+        if p_type == 1 {
+            // PT_LOAD
+            let p_offset = u64::from_le_bytes(data[ph + 8..ph + 16].try_into().unwrap());
+            let p_vaddr = u64::from_le_bytes(data[ph + 16..ph + 24].try_into().unwrap());
+            if !found_load {
+                elf_load_bias = p_vaddr - p_offset;
+                found_load = true;
+            }
+        }
+    }
 
     let mut eh_frame_offset = 0usize;
     let mut eh_frame_len = 0usize;
@@ -340,5 +409,6 @@ fn load_eh_frame(path: &PathBuf) -> io::Result<EhFrameCache> {
         eh_frame_len,
         eh_frame_vaddr,
         text_vaddr,
+        elf_load_bias,
     })
 }
