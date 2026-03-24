@@ -229,12 +229,21 @@ impl<'a> Profiler<'a> {
         force_sw: bool,
         user: bool,
         offcpu: bool,
+        tracepoint_name: Option<String>,
     ) -> Result<(), anyhow::Error> {
         let map = self.perf_stack_map.clone();
         let events = self.total_events.clone();
         let ns = self.total_ns.clone();
 
-        if !offcpu {
+        if let Some(ref tp_name) = tracepoint_name {
+            // raw_tp programs are attached by name, not via perf events
+            let link = skel
+                .progs
+                .trace_event
+                .attach_raw_tracepoint(tp_name)
+                .context(format!("failed to attach raw tracepoint '{tp_name}'"))?;
+            self.links = Some(vec![link]);
+        } else if !offcpu {
             self.pefds = Some(Profiler::<'a>::init_perf_monitor(
                 self, freq, force_sw, user,
             )?);

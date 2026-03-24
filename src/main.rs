@@ -1128,6 +1128,9 @@ pub struct Options {
     /// profile off-CPU (blocked) time for this many seconds
     #[clap(long, value_parser, default_value_t = 0)]
     offcpu: i32,
+    /// trace a kernel tracepoint (format: name:seconds, e.g. submit_bio:5)
+    #[clap(long, value_parser)]
+    trace: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -1144,11 +1147,28 @@ fn main() -> Result<()> {
     // Load BPF JIT symbols from /proc/kallsyms for resolving BPF program addresses
     let bpf_resolver = BpfKsymResolver::load();
 
-    // Control which BPF programs are loaded
-    if options.offcpu > 0 {
-        open_skel.progs.profile.set_autoload(false);
-    } else {
+    // Parse --trace name:seconds
+    let mut trace_name: Option<String> = None;
+    let mut trace_duration: i32 = 0;
+    if let Some(ref trace_arg) = options.trace {
+        let (name, secs) = trace_arg
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("--trace format: name:seconds (e.g. submit_bio:5)"))?;
+        trace_duration = secs
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid duration: {secs}"))?;
+        trace_name = Some(name.to_string());
+    }
+
+    // Control which BPF programs are loaded — only load what's needed
+    if trace_name.is_none() {
+        open_skel.progs.trace_event.set_autoload(false);
+    }
+    if options.offcpu == 0 {
         open_skel.progs.offcpu_switch.set_autoload(false);
+    }
+    if trace_name.is_some() || options.offcpu > 0 {
+        open_skel.progs.profile.set_autoload(false);
     }
 
     let rodata = open_skel.maps.rodata_data.as_mut().unwrap();
@@ -1190,7 +1210,7 @@ fn main() -> Result<()> {
     let mut task_pid_map: HashMap<(i32, u64), Task> = HashMap::new();
 
     let mut profiler = None;
-    let is_profiling = options.profile > 0 || options.offcpu > 0;
+    let is_profiling = options.profile > 0 || options.offcpu > 0 || trace_name.is_some();
     if is_profiling {
         profiler = Some(profile::Profiler::new(cpus_to_profile));
         let offcpu = options.offcpu > 0;
@@ -1200,6 +1220,7 @@ fn main() -> Result<()> {
             options.sw_perf,
             options.user,
             offcpu,
+            trace_name.clone(),
         )?;
     }
 
@@ -1218,7 +1239,9 @@ fn main() -> Result<()> {
                 &options,
             );
         } else {
-            let duration_secs = if options.offcpu > 0 {
+            let duration_secs = if trace_duration > 0 {
+                trace_duration
+            } else if options.offcpu > 0 {
                 options.offcpu
             } else {
                 options.profile
