@@ -373,8 +373,6 @@ impl<'a> Profiler<'a> {
         }
 
         let samples = self.dwarf_samples.borrow();
-        let total = *self.total_events.borrow();
-        let hit_threshold = std::cmp::max((total as f64 * 0.0025) as u64, 1);
 
         // Group samples by (pid, RIP, RSP) — same user register state
         // means same unwind result.  Accumulate hits and collect the
@@ -414,10 +412,6 @@ impl<'a> Profiler<'a> {
         let mut map = self.perf_stack_map.borrow_mut();
 
         for group in groups.values() {
-            if group.hits < hit_threshold {
-                continue;
-            }
-
             let uframes = unwinder.unwind(
                 group.pid,
                 group.regs[0],

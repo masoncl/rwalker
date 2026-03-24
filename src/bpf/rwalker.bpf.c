@@ -267,8 +267,7 @@ int offcpu_switch(u64 *ctx)
  * stack dump + registers.  Called from profile/trace/kfunc when
  * dwarf_mode is enabled.
  */
-static __always_inline int submit_dwarf_sample(void *ctx,
-					       struct task_struct *task)
+static __always_inline int submit_dwarf_sample(struct task_struct *task)
 {
 	struct dwarf_sample *ds;
 	struct pt_regs *regs;
@@ -276,7 +275,7 @@ static __always_inline int submit_dwarf_sample(void *ctx,
 
 	ds = bpf_ringbuf_reserve(&dwarf_events, sizeof(*ds), 0);
 	if (!ds)
-		return 1;
+		return 0;
 
 	ds->ts.pid = task->tgid;
 	ds->ts.tgid = task->pid;
@@ -289,11 +288,10 @@ static __always_inline int submit_dwarf_sample(void *ctx,
 	if (bpf_get_current_comm(ds->ts.comm, TASK_COMM_LEN))
 		ds->ts.comm[0] = 0;
 
-	/* Kernel stack */
-	res = bpf_get_stack(ctx, ds->ts.kstack, BPF_MAX_STACK_SIZE, 0);
-	if (res < 0)
-		res = 0;
-	ds->ts.kstack_len = res / sizeof(stackframe_t);
+	/* Kernel stack — use bpf_get_task_stack instead of bpf_get_stack
+	 * so this works in fentry/raw_tp context where ctx is not pt_regs.
+	 */
+	ds->ts.kstack_len = write_task_stack(task, ds->ts.kstack, 0);
 	ds->ts.ustack_len = 0;
 
 	/* User registers from pt_regs */
@@ -332,7 +330,7 @@ static __always_inline int submit_sample(void *ctx)
 	int32_t res;
 
 	if (dwarf_mode)
-		return submit_dwarf_sample(ctx, task);
+		return submit_dwarf_sample(task);
 
 	t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
 	if (!t)
