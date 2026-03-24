@@ -171,8 +171,22 @@ impl<'a> Profiler<'a> {
         let default_cpus: Vec<u32> = (0..nprocs as u32).collect();
         let cpus = self.cpus_to_profile.as_ref().unwrap_or(&default_cpus);
 
+        // Clamp frequency to kernel's max to avoid EINVAL — the kernel
+        // auto-tunes this value downward under load.
+        let max_freq = std::fs::read_to_string("/proc/sys/kernel/perf_event_max_sample_rate")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(freq);
+        let actual_freq = std::cmp::min(freq, max_freq);
+        if actual_freq < freq {
+            eprintln!(
+                "Clamping frequency from {} to {} Hz (kernel perf_event_max_sample_rate)",
+                freq, actual_freq
+            );
+        }
+
         attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
-        attr.sample.sample_freq = freq;
+        attr.sample.sample_freq = actual_freq;
         attr.flags = syscall::PERF_ATTR_FLAG_FREQ | syscall::PERF_ATTR_FLAG_EXCLUDE_GUEST;
         if !user {
             attr.flags |= syscall::PERF_ATTR_FLAG_EXCLUDE_USER;
