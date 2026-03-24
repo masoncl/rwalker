@@ -222,6 +222,7 @@ impl<'a> Profiler<'a> {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn setup(
         &mut self,
         skel: &'a RwalkerSkel<'a>,
@@ -230,6 +231,7 @@ impl<'a> Profiler<'a> {
         user: bool,
         offcpu: bool,
         tracepoint_name: Option<String>,
+        kfunc: bool,
     ) -> Result<(), anyhow::Error> {
         let map = self.perf_stack_map.clone();
         let events = self.total_events.clone();
@@ -242,6 +244,15 @@ impl<'a> Profiler<'a> {
                 .trace_event
                 .attach_raw_tracepoint(tp_name)
                 .context(format!("failed to attach raw tracepoint '{tp_name}'"))?;
+            self.links = Some(vec![link]);
+        } else if kfunc {
+            // fentry program — attach target was set before load,
+            // just call attach() to create the link
+            let link = skel
+                .progs
+                .kfunc_event
+                .attach()
+                .context("failed to attach kfunc")?;
             self.links = Some(vec![link]);
         } else if !offcpu {
             self.pefds = Some(Profiler::<'a>::init_perf_monitor(

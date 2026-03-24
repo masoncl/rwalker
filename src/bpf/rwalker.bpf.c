@@ -249,6 +249,42 @@ int offcpu_switch(u64 *ctx)
 	return 0;
 }
 
+SEC("fentry")
+int kfunc_event(void *ctx)
+{
+	struct task_struct *task = bpf_get_current_task_btf();
+	struct task_stack *t;
+	int32_t res;
+
+	t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
+	if (!t)
+		return 0;
+
+	t->pid = task->tgid;
+	t->tgid = task->pid;
+	t->task_ptr = 0;
+	t->wait_ns = 0;
+	t->switch_count = 0;
+	t->state = 0;
+	t->cpu = bpf_get_smp_processor_id();
+
+	if (bpf_get_current_comm(t->comm, TASK_COMM_LEN))
+		t->comm[0] = 0;
+
+	res = bpf_get_stack(ctx, t->kstack, BPF_MAX_STACK_SIZE, 0);
+	if (res < 0)
+		res = 0;
+	t->kstack_len = res / sizeof(stackframe_t);
+
+	res = bpf_get_stack(ctx, t->ustack, BPF_MAX_STACK_SIZE, BPF_F_USER_STACK);
+	if (res < 0)
+		res = 0;
+	t->ustack_len = res / sizeof(stackframe_t);
+
+	bpf_ringbuf_submit(t, 0);
+	return 0;
+}
+
 SEC("raw_tp")
 int trace_event(void *ctx)
 {

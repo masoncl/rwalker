@@ -1131,6 +1131,9 @@ pub struct Options {
     /// trace a kernel tracepoint (format: name:seconds, e.g. submit_bio:5)
     #[clap(long, value_parser)]
     trace: Option<String>,
+    /// trace a kernel function via fentry (format: name:seconds, e.g. ksys_write:5)
+    #[clap(long, value_parser)]
+    kfunc: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -1147,27 +1150,49 @@ fn main() -> Result<()> {
     // Load BPF JIT symbols from /proc/kallsyms for resolving BPF program addresses
     let bpf_resolver = BpfKsymResolver::load();
 
-    // Parse --trace name:seconds
+    // Parse --trace name:seconds and --kfunc name:seconds
     let mut trace_name: Option<String> = None;
+    let mut kfunc_name: Option<String> = None;
     let mut trace_duration: i32 = 0;
     if let Some(ref trace_arg) = options.trace {
         let (name, secs) = trace_arg
             .rsplit_once(':')
-            .ok_or_else(|| anyhow::anyhow!("--trace format: name:seconds (e.g. submit_bio:5)"))?;
+            .ok_or_else(|| anyhow::anyhow!("--trace format: name:seconds (e.g. sched_switch:5)"))?;
         trace_duration = secs
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid duration: {secs}"))?;
         trace_name = Some(name.to_string());
     }
+    if let Some(ref kfunc_arg) = options.kfunc {
+        let (name, secs) = kfunc_arg
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("--kfunc format: name:seconds (e.g. ksys_write:5)"))?;
+        trace_duration = secs
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid duration: {secs}"))?;
+        kfunc_name = Some(name.to_string());
+    }
 
     // Control which BPF programs are loaded — only load what's needed
-    if trace_name.is_none() {
+    let use_trace = trace_name.is_some();
+    let use_kfunc = kfunc_name.is_some();
+    if !use_trace {
         open_skel.progs.trace_event.set_autoload(false);
+    }
+    if !use_kfunc {
+        open_skel.progs.kfunc_event.set_autoload(false);
+    } else {
+        open_skel
+            .progs
+            .kfunc_event
+            .set_attach_target(0, kfunc_name.clone())?;
+        // Don't auto-attach — we attach manually in Profiler::setup
+        open_skel.progs.kfunc_event.set_autoattach(false);
     }
     if options.offcpu == 0 {
         open_skel.progs.offcpu_switch.set_autoload(false);
     }
-    if trace_name.is_some() || options.offcpu > 0 {
+    if use_trace || use_kfunc || options.offcpu > 0 {
         open_skel.progs.profile.set_autoload(false);
     }
 
@@ -1210,7 +1235,7 @@ fn main() -> Result<()> {
     let mut task_pid_map: HashMap<(i32, u64), Task> = HashMap::new();
 
     let mut profiler = None;
-    let is_profiling = options.profile > 0 || options.offcpu > 0 || trace_name.is_some();
+    let is_profiling = options.profile > 0 || options.offcpu > 0 || use_trace || use_kfunc;
     if is_profiling {
         profiler = Some(profile::Profiler::new(cpus_to_profile));
         let offcpu = options.offcpu > 0;
@@ -1221,6 +1246,7 @@ fn main() -> Result<()> {
             options.user,
             offcpu,
             trace_name.clone(),
+            use_kfunc,
         )?;
     }
 
@@ -1240,6 +1266,7 @@ fn main() -> Result<()> {
             );
         } else {
             let duration_secs = if trace_duration > 0 {
+                // --trace or --kfunc
                 trace_duration
             } else if options.offcpu > 0 {
                 options.offcpu

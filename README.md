@@ -82,6 +82,30 @@ the process mm is still active):
 rwalker --offcpu 5 -u
 ```
 
+### Tracepoint tracing
+
+```
+rwalker --trace sched_switch:5
+```
+
+Attaches to a kernel raw tracepoint and captures stacks on every hit
+for 5 seconds.  Shows which code paths trigger the tracepoint, with
+the same perf-report style output as CPU profiling.
+
+### Function tracing (kfunc)
+
+```
+rwalker --kfunc ksys_write:5
+```
+
+Attaches to a kernel function entry via BPF fentry/trampoline.  Shows
+all call chains that reach the function.  Useful for tracing specific
+syscalls or internal kernel functions.  Add `-u` for user stacks:
+
+```
+rwalker --kfunc ksys_write:5 -u -c myapp
+```
+
 ### Options
 
 ```
@@ -99,6 +123,8 @@ Options:
   -C, --count <N>      Stop after N iterations in interval mode [default: 0]
   -p, --profile <N>    Profile CPU usage for N seconds [default: 0]
       --offcpu <N>     Profile off-CPU (blocked) time for N seconds [default: 0]
+      --trace <N:S>    Trace a raw tracepoint (e.g. sched_switch:5)
+      --kfunc <N:S>    Trace a kernel function via fentry (e.g. ksys_write:5)
   -u, --user           Include user-space stacks (requires frame pointers)
   -P, --cpus <CPUS>    CPU mask for profiling (e.g. "0-3" or "1,4,7")
   -f, --freq <N>       Sampling frequency in Hz [default: 4000]
@@ -141,6 +167,16 @@ rwalker --offcpu 5 -u -c myapp
 Monitor D-state tasks every 5 seconds, 20 iterations:
 ```
 rwalker -i 5 -C 20
+```
+
+Trace what's calling schedule:
+```
+rwalker --trace sched_switch:5
+```
+
+Trace write syscalls from a specific process:
+```
+rwalker --kfunc ksys_write:5 -u -c myapp
 ```
 
 Profile in a VM without hardware PMU:
@@ -189,7 +225,7 @@ instruction offset that collected the most samples.
 ```
 src/
   bpf/
-    rwalker.bpf.c   BPF programs (task iterator, perf_event profiler, sched_switch off-CPU)
+    rwalker.bpf.c   BPF programs (task iterator, perf_event profiler, sched_switch off-CPU, raw_tp tracer, fentry kfunc tracer)
     vmlinux.h        Kernel type definitions for BPF CO-RE
   main.rs            CLI, task walking, profiling output, call tree display
   profile.rs         Profiler: perf event setup, ringbuf consumption, stack aggregation
@@ -219,6 +255,15 @@ recording switch-out timestamps and user stacks in a per-pid hash map,
 then computing the delta at switch-in.  Events below 1ms are filtered
 in BPF.  Kernel stacks are captured fresh at switch-in; user stacks
 are replayed from switch-out (when the process mm was still active).
+
+**`trace_event`** (raw_tp) -- Generic tracepoint tracer.  Attached to
+any raw tracepoint by name at runtime.  Captures kernel and user
+stacks on every hit.
+
+**`kfunc_event`** (fentry) -- Function entry tracer via BPF
+trampoline.  The target function is set at runtime via
+`set_attach_target()` before loading.  Captures kernel and user
+stacks on every call to the target function.
 
 ### Rust components
 
