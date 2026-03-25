@@ -30,6 +30,14 @@ const volatile int iter_mode = 0;
 const volatile uint64_t offcpu_min_ns = 1000000; /* 1ms default threshold */
 const volatile int dwarf_mode = 0;
 
+/* Counters for dropped samples due to ringbuf overflow */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} drop_count SEC(".maps");
+
 #define BPF_MAX_STACK_DEPTH 127
 #define BPF_MAX_STACK_SIZE (BPF_MAX_STACK_DEPTH * sizeof(stackframe_t))
 #define DWARF_STACK_SIZE 16384 /* 16KB — enough for most stacks, keeps ringbuf usage reasonable */
@@ -58,7 +66,7 @@ struct dwarf_sample {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 64 * 1024 * 1024);
+	__uint(max_entries, 192 * 1024 * 1024);
 } dwarf_events SEC(".maps");
 
 
@@ -233,6 +241,10 @@ int offcpu_switch(u64 *ctx)
 
 	struct task_stack *t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
 	if (!t) {
+		u32 zero = 0;
+		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
 		bpf_map_delete_elem(&offcpu_start, &next_pid);
 		return 0;
 	}
@@ -276,8 +288,13 @@ static __always_inline int submit_dwarf_sample(struct task_struct *task)
 	int32_t res;
 
 	ds = bpf_ringbuf_reserve(&dwarf_events, sizeof(*ds), 0);
-	if (!ds)
+	if (!ds) {
+		u32 zero = 0;
+		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
 		return 0;
+	}
 
 	ds->ts.pid = task->tgid;
 	ds->ts.tgid = task->pid;
@@ -347,8 +364,13 @@ static __always_inline int submit_sample(void *ctx)
 		return submit_dwarf_sample(task);
 
 	t = bpf_ringbuf_reserve(&events, sizeof(*t), 0);
-	if (!t)
+	if (!t) {
+		u32 zero = 0;
+		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
 		return 0;
+	}
 
 	t->pid = task->tgid;
 	t->tgid = task->pid;

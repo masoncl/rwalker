@@ -10,6 +10,7 @@ use libbpf_rs::skel::OpenSkel as _;
 use libbpf_rs::skel::Skel as _;
 use libbpf_rs::skel::SkelBuilder as _;
 use libbpf_rs::Link;
+use libbpf_rs::MapCore;
 use regex::Regex;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1192,6 +1193,9 @@ pub struct Options {
     /// only show leaf functions above this percentage
     #[clap(long, value_parser, default_value_t = 1.0)]
     output_filter: f64,
+    /// dwarf ringbuf size in MB (increase for high-rate tracepoints)
+    #[clap(long, value_parser, default_value_t = 192)]
+    dwarf_buf_mb: u32,
 }
 
 fn main() -> Result<()> {
@@ -1264,6 +1268,11 @@ fn main() -> Result<()> {
     }
     if options.dwarf {
         rodata.dwarf_mode = 1;
+        open_skel
+            .maps
+            .dwarf_events
+            .set_max_entries(options.dwarf_buf_mb * 1024 * 1024)
+            .expect("failed to set dwarf_events ringbuf size");
     }
 
     //
@@ -1341,6 +1350,32 @@ fn main() -> Result<()> {
                 let elapsed = start.elapsed();
                 if elapsed >= profile_duration {
                     profiler.as_mut().unwrap().unwind_dwarf_samples();
+                    // Read drop count from BPF per-CPU array
+                    let key = 0u32.to_ne_bytes();
+                    if let Ok(Some(values)) = skel
+                        .maps
+                        .drop_count
+                        .lookup_percpu(&key, libbpf_rs::MapFlags::ANY)
+                    {
+                        let total_drops: u64 = values
+                            .iter()
+                            .map(|v| {
+                                if v.len() >= 8 {
+                                    u64::from_ne_bytes(v[..8].try_into().unwrap_or([0; 8]))
+                                } else {
+                                    0
+                                }
+                            })
+                            .sum();
+                        if total_drops > 0 {
+                            let total = *profiler.as_ref().unwrap().total_events.borrow();
+                            eprintln!(
+                                "warning: {} samples dropped due to ringbuf overflow ({:.1}% loss)",
+                                total_drops,
+                                total_drops as f64 / (total + total_drops) as f64 * 100.0
+                            );
+                        }
+                    }
                     print_perf_stacks(
                         profiler.as_mut().unwrap(),
                         &symbolizer,
