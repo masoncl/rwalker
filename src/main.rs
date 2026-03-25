@@ -479,13 +479,15 @@ fn format_node_name(name: &str, node: &CallTreeNode) -> String {
     }
 }
 
-fn print_call_chain(node: &CallTreeNode, total_events: u64, prefix: &str) {
-    let mut children: Vec<_> = node
-        .children
-        .iter()
-        .filter(|(_, child)| (child.hits as f64 / total_events as f64) * 100.0 >= 0.25)
-        .collect();
+fn print_call_chain(node: &CallTreeNode, total_events: u64, prefix: &str, min_pct: f64) {
+    // Always include the heaviest child so there's at least one
+    // complete path through the tree, even if below the threshold.
+    let mut children: Vec<_> = node.children.iter().collect();
     children.sort_by(|a, b| b.1.hits.cmp(&a.1.hits));
+    let heaviest_hits = children.first().map(|(_, c)| c.hits).unwrap_or(0);
+    children.retain(|(_, child)| {
+        child.hits == heaviest_hits || (child.hits as f64 / total_events as f64) * 100.0 >= min_pct
+    });
 
     match children.len() {
         0 => {}
@@ -494,7 +496,7 @@ fn print_call_chain(node: &CallTreeNode, total_events: u64, prefix: &str) {
             let (name, child) = children[0];
             let display = format_node_name(name, child);
             println!("{prefix}{display}");
-            print_call_chain(child, total_events, prefix);
+            print_call_chain(child, total_events, prefix, min_pct);
         }
         _ => {
             // Multiple children - branch point
@@ -506,11 +508,11 @@ fn print_call_chain(node: &CallTreeNode, total_events: u64, prefix: &str) {
                 if is_last {
                     println!("{prefix} {marker}{display}");
                     let pad = " ".repeat(marker.len() + 1);
-                    print_call_chain(child, total_events, &format!("{prefix}{pad}"));
+                    print_call_chain(child, total_events, &format!("{prefix}{pad}"), min_pct);
                 } else {
                     println!("{prefix}|{marker}{display}");
                     let pad = " ".repeat(marker.len());
-                    print_call_chain(child, total_events, &format!("{prefix}|{pad}"));
+                    print_call_chain(child, total_events, &format!("{prefix}|{pad}"), min_pct);
                 }
             }
         }
@@ -1080,7 +1082,7 @@ fn print_perf_stacks(
         }
         let group_weight = if offcpu { group.total_ns } else { group.hits };
         let pct = (group_weight as f64 / adjusted_total as f64) * 100.0;
-        if pct < 0.25 {
+        if pct < options.output_filter {
             continue;
         }
         displayed += 1;
@@ -1122,7 +1124,12 @@ fn print_perf_stacks(
             println!(">>> {:.2}%  {}  Comms: {}", pct, leaf_display, comms);
         }
         println!("            |");
-        print_call_chain(&group.tree, adjusted_total, "            ");
+        print_call_chain(
+            &group.tree,
+            adjusted_total,
+            "            ",
+            options.output_filter,
+        );
     }
 }
 
@@ -1182,6 +1189,9 @@ pub struct Options {
     /// use DWARF unwinding for user stacks (works without frame pointers)
     #[clap(long, action = clap::ArgAction::SetTrue)]
     dwarf: bool,
+    /// only show leaf functions above this percentage
+    #[clap(long, value_parser, default_value_t = 1.0)]
+    output_filter: f64,
 }
 
 fn main() -> Result<()> {
