@@ -556,7 +556,7 @@ fn print_perf_stacks(
     // In offcpu mode, weight by total blocked time; in on-CPU mode, by sample count
     let total_weight = if offcpu { total_ns } else { total_events };
     let map = profiler.perf_stack_map.borrow();
-    let hit_threshold = std::cmp::max((total_weight as f64 * 0.0025) as u64, 1);
+    let hit_threshold = 1u64;
 
     // Phase 1: batch-symbolize all unique leaf addresses.
     // Kernel addresses (above 0xffff...) use the kernel source.
