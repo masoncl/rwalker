@@ -306,13 +306,25 @@ static __always_inline int submit_dwarf_sample(struct task_struct *task)
 		ds->user_regs[2] = 0;
 	}
 
-	/* Raw user stack dump */
+	/* Raw user stack dump — read in pages to capture partial stacks
+	 * when some pages are not faulted in.
+	 */
+	ds->stack_len = 0;
 	if (ds->user_regs[1]) {
-		res = bpf_probe_read_user(ds->user_stack, DWARF_STACK_SIZE,
-					  (void *)ds->user_regs[1]);
-		ds->stack_len = (res == 0) ? DWARF_STACK_SIZE : 0;
-	} else {
-		ds->stack_len = 0;
+		void *sp = (void *)ds->user_regs[1];
+		uint32_t off;
+
+		#pragma unroll
+		for (off = 0; off < DWARF_STACK_SIZE; off += 4096) {
+			uint32_t chunk = DWARF_STACK_SIZE - off;
+			if (chunk > 4096)
+				chunk = 4096;
+			res = bpf_probe_read_user(ds->user_stack + off,
+						  chunk, sp + off);
+			if (res < 0)
+				break;
+			ds->stack_len = off + chunk;
+		}
 	}
 
 	bpf_ringbuf_submit(ds, 0);
