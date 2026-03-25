@@ -17,7 +17,7 @@ use anyhow::Context;
 use crate::skel::BPF_MAX_STACK_DEPTH;
 use crate::syscall;
 
-const DWARF_STACK_SIZE: usize = 32768;
+const DWARF_STACK_SIZE: usize = 65536;
 
 /// Layout must match struct dwarf_sample in rwalker.bpf.c
 #[repr(C)]

@@ -173,16 +173,33 @@ impl DwarfUnwinder {
             };
 
             // Evaluate CFA
-            let cfa = match row.cfa() {
-                CfaRule::RegisterAndOffset { register, offset } => {
-                    let reg_val = get_reg(*register, cur_rsp, cur_rbp);
-                    match reg_val {
-                        Some(v) => (v as i64 + *offset) as u64,
-                        None => break,
+            let cfa =
+                match row.cfa() {
+                    CfaRule::RegisterAndOffset { register, offset } => {
+                        let reg_val = get_reg(*register, cur_rsp, cur_rbp);
+                        match reg_val {
+                            Some(v) => {
+                                if debug {
+                                    eprintln!(
+                                    "  frame {frame_idx}: CFA = reg{}({:#x}) + {offset} = {:#x}",
+                                    register.0, v, (v as i64 + *offset) as u64
+                                );
+                                }
+                                (v as i64 + *offset) as u64
+                            }
+                            None => {
+                                if debug {
+                                    eprintln!(
+                                    "  frame {frame_idx}: CFA needs reg{} — not tracked, stopping",
+                                    register.0
+                                );
+                                }
+                                break;
+                            }
+                        }
                     }
-                }
-                _ => break, // Expression-based CFA not supported
-            };
+                    _ => break, // Expression-based CFA not supported
+                };
 
             // Recover return address
             let new_rip = match row.register(gimli::X86_64::RA) {
@@ -190,8 +207,24 @@ impl DwarfUnwinder {
                 RegisterRule::Offset(off) => {
                     let addr = (cfa as i64 + off) as u64;
                     match read_stack_u64(stack, stack_base, addr) {
-                        Some(v) => v,
-                        None => break,
+                        Some(v) => {
+                            if debug {
+                                eprintln!(
+                                    "  frame {frame_idx}: RA at CFA{off:+} = stack[{:#x}] = {v:#x}",
+                                    addr
+                                );
+                            }
+                            v
+                        }
+                        None => {
+                            if debug {
+                                eprintln!(
+                                    "  frame {frame_idx}: RA at {addr:#x} outside stack dump ({stack_base:#x}..{:#x})",
+                                    stack_base + stack.len() as u64
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
                 RegisterRule::SameValue => cur_rip,
