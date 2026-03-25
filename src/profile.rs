@@ -17,17 +17,6 @@ use anyhow::Context;
 use crate::skel::BPF_MAX_STACK_DEPTH;
 use crate::syscall;
 
-const DWARF_STACK_SIZE: usize = 65536;
-
-/// Layout must match struct dwarf_sample in rwalker.bpf.c
-#[repr(C)]
-struct DwarfSample {
-    ts: task_stack,
-    user_regs: [u64; 3], // RIP, RSP, RBP
-    stack_len: u32,
-    user_stack: [u8; DWARF_STACK_SIZE],
-}
-
 // Raw stack frame keyed by addresses and pid.  The tree grouping
 // merges across CPUs by function name, so separating by CPU here would
 // just inflate the map.  pid is included because the same virtual address
@@ -144,6 +133,17 @@ pub struct RawDwarfSample {
 
 pub type DwarfSamples = Rc<RefCell<Vec<RawDwarfSample>>>;
 
+const DWARF_STACK_SIZE: usize = 16384;
+
+/// Layout must match struct dwarf_sample in rwalker.bpf.c
+#[repr(C)]
+struct DwarfSample {
+    ts: task_stack,
+    user_regs: [u64; 3],
+    stack_len: u32,
+    user_stack: [u8; DWARF_STACK_SIZE],
+}
+
 fn dwarf_event_handler(
     total_events: &Rc<RefCell<u64>>,
     total_ns: &Rc<RefCell<u64>>,
@@ -163,7 +163,7 @@ fn dwarf_event_handler(
     *total_events.borrow_mut() += 1;
     *total_ns.borrow_mut() += sample.ts.wait_ns;
 
-    let stack_len = sample.stack_len as usize;
+    let stack_len = (sample.stack_len as usize).min(DWARF_STACK_SIZE);
     dwarf_samples.borrow_mut().push(RawDwarfSample {
         pid: sample.ts.pid,
         kstack: sample.ts.kstack,

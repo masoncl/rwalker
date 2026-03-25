@@ -32,7 +32,7 @@ const volatile int dwarf_mode = 0;
 
 #define BPF_MAX_STACK_DEPTH 127
 #define BPF_MAX_STACK_SIZE (BPF_MAX_STACK_DEPTH * sizeof(stackframe_t))
-#define DWARF_STACK_SIZE 65536 /* 64KB to capture deep user stacks */
+#define DWARF_STACK_SIZE 16384 /* 16KB — enough for most stacks, keeps ringbuf usage reasonable */
 
 struct task_stack {
 	pid_t pid;
@@ -60,6 +60,8 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 64 * 1024 * 1024);
 } dwarf_events SEC(".maps");
+
+
 
 struct task_struct___post514 {
 	unsigned int __state;
