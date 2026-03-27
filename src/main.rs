@@ -1099,7 +1099,10 @@ pub struct Options {
     output_filter: f64,
     /// dwarf ringbuf size in MB (increase for high-rate tracepoints)
     #[clap(long, value_parser, default_value_t = 192)]
-    dwarf_buf_mb: u32,
+    dwarf_ringbuf_size: u32,
+    /// ringbuf size in MB for frame-pointer samples
+    #[clap(long, value_parser, default_value_t = 64)]
+    ringbuf_size: u32,
 }
 
 fn main() -> Result<()> {
@@ -1170,12 +1173,17 @@ fn main() -> Result<()> {
     } else {
         rodata.iter_mode = RWALKER_ITER_MODE_DSTATE;
     }
+    open_skel
+        .maps
+        .events
+        .set_max_entries(options.ringbuf_size * 1024 * 1024)
+        .expect("failed to set events ringbuf size");
     if options.dwarf {
         rodata.dwarf_mode = 1;
         open_skel
             .maps
             .dwarf_events
-            .set_max_entries(options.dwarf_buf_mb * 1024 * 1024)
+            .set_max_entries(options.dwarf_ringbuf_size * 1024 * 1024)
             .expect("failed to set dwarf_events ringbuf size");
     } else {
         // Minimize DWARF offcpu maps when not in DWARF mode
