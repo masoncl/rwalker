@@ -8,6 +8,10 @@ cargo fmt ; cargo clippy ; cargo build --release
 ```
 All three must pass with no errors or warnings.
 
+## Commits
+
+Always use `git commit -s` to add a Signed-off-by line.
+
 ## Build system
 
 The BPF C program (`src/bpf/rwalker.bpf.c`) is compiled into a Rust skeleton by `build.rs` using libbpf-cargo. The generated skel lands in `$OUT_DIR/rwalker.skel.rs` and is included via `src/skel.rs`. Changing the BPF C struct layout (e.g. `struct task_stack`) automatically regenerates the Rust bindings — no manual sync needed.
