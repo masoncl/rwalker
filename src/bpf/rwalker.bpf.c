@@ -193,6 +193,157 @@ struct {
 	__type(value, struct offcpu_val);
 } offcpu_start SEC(".maps");
 
+/* Capture user registers + raw stack dump from a task.
+ * Writes RIP/RSP/RBP into user_regs[3], raw stack bytes into
+ * user_stack[DWARF_STACK_SIZE], and the actual byte count into *stack_len.
+ */
+static __always_inline void capture_user_dwarf(struct task_struct *task,
+					       uint64_t *user_regs,
+					       uint8_t *user_stack,
+					       uint32_t *stack_len)
+{
+	struct pt_regs *regs;
+	int32_t res;
+
+	regs = (struct pt_regs *)bpf_task_pt_regs(task);
+	if (regs) {
+		user_regs[0] = BPF_CORE_READ(regs, ip);
+		user_regs[1] = BPF_CORE_READ(regs, sp);
+		user_regs[2] = BPF_CORE_READ(regs, bp);
+	} else {
+		user_regs[0] = 0;
+		user_regs[1] = 0;
+		user_regs[2] = 0;
+	}
+
+	*stack_len = 0;
+	if (user_regs[1]) {
+		void *sp = (void *)user_regs[1];
+		uint32_t off;
+
+		#pragma unroll
+		for (off = 0; off < DWARF_STACK_SIZE; off += 4096) {
+			uint32_t chunk = DWARF_STACK_SIZE - off;
+			if (chunk > 4096)
+				chunk = 4096;
+			res = bpf_probe_read_user(user_stack + off,
+						  chunk, sp + off);
+			if (res < 0)
+				break;
+			*stack_len = off + chunk;
+		}
+	}
+}
+
+/* DWARF off-CPU: store raw user stack dump + registers at switch-out.
+ * Much larger per-entry than offcpu_val, so uses NO_PREALLOC and
+ * fewer max_entries.
+ */
+struct offcpu_dwarf_val {
+	u64 timestamp;
+	pid_t tgid;
+	uint64_t user_regs[3]; /* RIP, RSP, RBP */
+	uint32_t stack_len;
+	uint8_t user_stack[DWARF_STACK_SIZE];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, u32);
+	__type(value, struct offcpu_dwarf_val);
+} offcpu_dwarf_start SEC(".maps");
+
+/* Per-CPU scratch buffer for building offcpu_dwarf_val entries
+ * (too large for BPF stack).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct offcpu_dwarf_val);
+} offcpu_dwarf_scratch SEC(".maps");
+
+/* DWARF off-CPU switch-out: capture user registers + raw stack dump
+ * while prev's mm is still active.
+ */
+static __always_inline void offcpu_dwarf_switch_out(struct task_struct *prev,
+						    u32 prev_pid, u64 now)
+{
+	u32 zero = 0;
+	struct offcpu_dwarf_val *scratch;
+
+	scratch = bpf_map_lookup_elem(&offcpu_dwarf_scratch, &zero);
+	if (!scratch)
+		return;
+
+	scratch->timestamp = now;
+	scratch->tgid = prev->tgid;
+
+	capture_user_dwarf(prev, scratch->user_regs,
+			   scratch->user_stack, &scratch->stack_len);
+
+	bpf_map_update_elem(&offcpu_dwarf_start, &prev_pid, scratch, BPF_ANY);
+}
+
+/* DWARF off-CPU switch-in: submit dwarf_sample with stored user data
+ * and fresh kernel stack.
+ */
+static __always_inline void offcpu_dwarf_switch_in(struct task_struct *next,
+						   u32 next_pid, u64 now)
+{
+	struct offcpu_dwarf_val *stored;
+	struct dwarf_sample *ds;
+	u64 delta;
+
+	stored = bpf_map_lookup_elem(&offcpu_dwarf_start, &next_pid);
+	if (!stored)
+		return;
+
+	delta = now - stored->timestamp;
+
+	if (delta < offcpu_min_ns) {
+		bpf_map_delete_elem(&offcpu_dwarf_start, &next_pid);
+		return;
+	}
+
+	ds = bpf_ringbuf_reserve(&dwarf_events, sizeof(*ds), 0);
+	if (!ds) {
+		u32 zero = 0;
+		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
+		bpf_map_delete_elem(&offcpu_dwarf_start, &next_pid);
+		return;
+	}
+
+	ds->ts.pid = stored->tgid;
+	ds->ts.tgid = next_pid;
+	ds->ts.task_ptr = 0;
+	ds->ts.wait_ns = delta;
+	ds->ts.switch_count = 0;
+	ds->ts.state = 0;
+	ds->ts.cpu = bpf_get_smp_processor_id();
+
+	bpf_probe_read_kernel_str(ds->ts.comm, TASK_COMM_LEN, next->comm);
+
+	ds->ts.kstack_len = write_task_stack(next, ds->ts.kstack, 0);
+	ds->ts.ustack_len = 0;
+
+	/* Replay stored user registers and raw stack */
+	ds->user_regs[0] = stored->user_regs[0];
+	ds->user_regs[1] = stored->user_regs[1];
+	ds->user_regs[2] = stored->user_regs[2];
+	ds->stack_len = stored->stack_len;
+	if (stored->stack_len > 0)
+		bpf_probe_read_kernel(ds->user_stack, DWARF_STACK_SIZE,
+				      stored->user_stack);
+
+	bpf_map_delete_elem(&offcpu_dwarf_start, &next_pid);
+	bpf_ringbuf_submit(ds, 0);
+}
+
 SEC("tp_btf/sched_switch")
 int offcpu_switch(u64 *ctx)
 {
@@ -204,6 +355,14 @@ int offcpu_switch(u64 *ctx)
 	u64 now = bpf_ktime_get_ns();
 	u32 prev_pid = prev->pid;
 	u32 next_pid = next->pid;
+
+	if (dwarf_mode) {
+		if (prev_pid != 0)
+			offcpu_dwarf_switch_out(prev, prev_pid, now);
+		if (next_pid != 0)
+			offcpu_dwarf_switch_in(next, next_pid, now);
+		return 0;
+	}
 
 	/* Record switch-out: capture timestamp and user stack from prev
 	 * while its mm is still active.
@@ -284,8 +443,6 @@ int offcpu_switch(u64 *ctx)
 static __always_inline int submit_dwarf_sample(struct task_struct *task)
 {
 	struct dwarf_sample *ds;
-	struct pt_regs *regs;
-	int32_t res;
 
 	ds = bpf_ringbuf_reserve(&dwarf_events, sizeof(*ds), 0);
 	if (!ds) {
@@ -313,38 +470,8 @@ static __always_inline int submit_dwarf_sample(struct task_struct *task)
 	ds->ts.kstack_len = write_task_stack(task, ds->ts.kstack, 0);
 	ds->ts.ustack_len = 0;
 
-	/* User registers from pt_regs */
-	regs = (struct pt_regs *)bpf_task_pt_regs(task);
-	if (regs) {
-		ds->user_regs[0] = BPF_CORE_READ(regs, ip);
-		ds->user_regs[1] = BPF_CORE_READ(regs, sp);
-		ds->user_regs[2] = BPF_CORE_READ(regs, bp);
-	} else {
-		ds->user_regs[0] = 0;
-		ds->user_regs[1] = 0;
-		ds->user_regs[2] = 0;
-	}
-
-	/* Raw user stack dump — read in pages to capture partial stacks
-	 * when some pages are not faulted in.
-	 */
-	ds->stack_len = 0;
-	if (ds->user_regs[1]) {
-		void *sp = (void *)ds->user_regs[1];
-		uint32_t off;
-
-		#pragma unroll
-		for (off = 0; off < DWARF_STACK_SIZE; off += 4096) {
-			uint32_t chunk = DWARF_STACK_SIZE - off;
-			if (chunk > 4096)
-				chunk = 4096;
-			res = bpf_probe_read_user(ds->user_stack + off,
-						  chunk, sp + off);
-			if (res < 0)
-				break;
-			ds->stack_len = off + chunk;
-		}
-	}
+	capture_user_dwarf(task, ds->user_regs,
+			   ds->user_stack, &ds->stack_len);
 
 	bpf_ringbuf_submit(ds, 0);
 	return 0;

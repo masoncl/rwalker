@@ -1273,6 +1273,13 @@ fn main() -> Result<()> {
             .dwarf_events
             .set_max_entries(options.dwarf_buf_mb * 1024 * 1024)
             .expect("failed to set dwarf_events ringbuf size");
+    } else {
+        // Minimize DWARF offcpu maps when not in DWARF mode
+        open_skel
+            .maps
+            .offcpu_dwarf_start
+            .set_max_entries(1)
+            .expect("failed to set offcpu_dwarf_start size");
     }
 
     //
