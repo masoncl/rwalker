@@ -402,11 +402,44 @@ fn __comm_to_str(comm: &[u8; crate::skel::TASK_COMM_LEN]) -> String {
 }
 
 // Resolved frame: function name + offset within the function.
+// Also used as the leaf symbol type in print_perf_stacks (formerly LeafSym).
 #[derive(Clone)]
 struct ResolvedFrame {
     name: String,
     offset: usize,
     line_info: String, // pre-formatted "file.c:123" or ""
+}
+
+fn resolve_sym(sym: symbolize::Symbolized<'_>) -> ResolvedFrame {
+    match sym {
+        symbolize::Symbolized::Sym(s) => {
+            let line_info = s
+                .code_info
+                .as_ref()
+                .map(|ci| {
+                    let path = ci.to_path();
+                    let file = path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    match ci.line {
+                        Some(line) => format!("{file}:{line}"),
+                        None => file,
+                    }
+                })
+                .unwrap_or_default();
+            ResolvedFrame {
+                name: s.name.to_string(),
+                offset: s.offset,
+                line_info,
+            }
+        }
+        symbolize::Symbolized::Unknown(_) => ResolvedFrame {
+            name: "<no-symbol>".to_string(),
+            offset: 0,
+            line_info: String::new(),
+        },
+    }
 }
 
 // Call chain tree node for perf-report-style grouping.
@@ -578,19 +611,13 @@ fn print_perf_stacks(
         .symbolize(&kernel_src, symbolize::Input::AbsAddr(&kernel_leaf_addrs))
         .unwrap_or_default();
 
-    struct LeafSym {
-        name: String,
-        offset: usize,
-        line_info: String,
-    }
-
-    let mut leaf_sym_map: HashMap<u64, LeafSym> = HashMap::new();
+    let mut leaf_sym_map: HashMap<u64, ResolvedFrame> = HashMap::new();
     for (addr, sym) in kernel_leaf_addrs.iter().copied().zip(leaf_syms) {
         // Check BPF JIT resolver first
         if let Some((bpf_name, bpf_offset)) = bpf_resolver.resolve(addr) {
             leaf_sym_map.insert(
                 addr,
-                LeafSym {
+                ResolvedFrame {
                     name: bpf_name.to_string(),
                     offset: bpf_offset,
                     line_info: String::new(),
@@ -598,43 +625,7 @@ fn print_perf_stacks(
             );
             continue;
         }
-        match sym {
-            symbolize::Symbolized::Sym(s) => {
-                let line_info = s
-                    .code_info
-                    .as_ref()
-                    .map(|ci| {
-                        let path = ci.to_path();
-                        let file = path
-                            .file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        match ci.line {
-                            Some(line) => format!("{file}:{line}"),
-                            None => file,
-                        }
-                    })
-                    .unwrap_or_default();
-                leaf_sym_map.insert(
-                    addr,
-                    LeafSym {
-                        name: s.name.to_string(),
-                        offset: s.offset,
-                        line_info,
-                    },
-                );
-            }
-            symbolize::Symbolized::Unknown(_) => {
-                leaf_sym_map.insert(
-                    addr,
-                    LeafSym {
-                        name: "<no-symbol>".to_string(),
-                        offset: 0,
-                        line_info: String::new(),
-                    },
-                );
-            }
-        }
+        leaf_sym_map.insert(addr, resolve_sym(sym));
     }
 
     // Process sources are built incrementally — phase 1b adds pids for
@@ -664,36 +655,7 @@ fn print_perf_stacks(
                 .symbolize(proc_src, symbolize::Input::AbsAddr(addrs))
                 .unwrap_or_default();
             for (addr, sym) in addrs.iter().copied().zip(syms) {
-                let resolved = match sym {
-                    symbolize::Symbolized::Sym(s) => {
-                        let line_info = s
-                            .code_info
-                            .as_ref()
-                            .map(|ci| {
-                                let path = ci.to_path();
-                                let file = path
-                                    .file_name()
-                                    .map(|f| f.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                match ci.line {
-                                    Some(line) => format!("{file}:{line}"),
-                                    None => file,
-                                }
-                            })
-                            .unwrap_or_default();
-                        LeafSym {
-                            name: s.name.to_string(),
-                            offset: s.offset,
-                            line_info,
-                        }
-                    }
-                    symbolize::Symbolized::Unknown(_) => LeafSym {
-                        name: "<no-symbol>".to_string(),
-                        offset: 0,
-                        line_info: String::new(),
-                    },
-                };
-                leaf_sym_map.insert(addr, resolved);
+                leaf_sym_map.insert(addr, resolve_sym(sym));
             }
         }
     }
@@ -902,36 +864,7 @@ fn print_perf_stacks(
                 );
                 continue;
             }
-            let frame = match sym {
-                symbolize::Symbolized::Sym(s) => {
-                    let line_info = s
-                        .code_info
-                        .as_ref()
-                        .map(|ci| {
-                            let path = ci.to_path();
-                            let file = path
-                                .file_name()
-                                .map(|f| f.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            match ci.line {
-                                Some(line) => format!("{file}:{line}"),
-                                None => file,
-                            }
-                        })
-                        .unwrap_or_default();
-                    ResolvedFrame {
-                        name: s.name.to_string(),
-                        offset: s.offset,
-                        line_info,
-                    }
-                }
-                symbolize::Symbolized::Unknown(_) => ResolvedFrame {
-                    name: "<no-symbol>".to_string(),
-                    offset: 0,
-                    line_info: String::new(),
-                },
-            };
-            kernel_cache.insert(addr, frame);
+            kernel_cache.insert(addr, resolve_sym(sym));
         }
     }
 
@@ -946,36 +879,7 @@ fn print_perf_stacks(
                 .symbolize(proc_src, symbolize::Input::AbsAddr(addrs))
                 .unwrap_or_default();
             for (addr, sym) in addrs.iter().copied().zip(syms) {
-                let frame = match sym {
-                    symbolize::Symbolized::Sym(s) => {
-                        let line_info = s
-                            .code_info
-                            .as_ref()
-                            .map(|ci| {
-                                let path = ci.to_path();
-                                let file = path
-                                    .file_name()
-                                    .map(|f| f.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                match ci.line {
-                                    Some(line) => format!("{file}:{line}"),
-                                    None => file,
-                                }
-                            })
-                            .unwrap_or_default();
-                        ResolvedFrame {
-                            name: s.name.to_string(),
-                            offset: s.offset,
-                            line_info,
-                        }
-                    }
-                    symbolize::Symbolized::Unknown(_) => ResolvedFrame {
-                        name: "<no-symbol>".to_string(),
-                        offset: 0,
-                        line_info: String::new(),
-                    },
-                };
-                ucache.insert(addr, frame);
+                ucache.insert(addr, resolve_sym(sym));
             }
         }
     }
