@@ -695,6 +695,7 @@ fn print_perf_stacks(
     };
 
     let mut func_hits: HashMap<String, (u64, usize, u64, String)> = HashMap::new();
+    let mut filtered_weight: u64 = 0;
     for (frame, counter) in map.iter() {
         // Skip entries that don't match the -c filter
         if let Some(ref re) = comm_re {
@@ -717,6 +718,7 @@ fn print_perf_stacks(
         } else {
             counter.hits
         };
+        filtered_weight += weight;
         let entry = func_hits
             .entry(name.to_string())
             .or_insert((0, 0, 0, String::new()));
@@ -975,7 +977,11 @@ fn print_perf_stacks(
         aw.cmp(&bw)
     });
 
-    let adjusted_total = total_weight;
+    let adjusted_total = if comm_re.is_some() {
+        filtered_weight
+    } else {
+        total_weight
+    };
 
     let mut displayed = 0;
     for (leaf_name, group) in sorted.iter() {
