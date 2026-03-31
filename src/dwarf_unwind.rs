@@ -4,7 +4,8 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 use gimli::{
-    BaseAddresses, CfaRule, EhFrame, NativeEndian, RegisterRule, UnwindContext, UnwindSection,
+    BaseAddresses, CfaRule, EhFrame, EhFrameHdr, NativeEndian, RegisterRule, UnwindContext,
+    UnwindSection,
 };
 use memmap2::Mmap;
 
@@ -32,6 +33,10 @@ struct EhFrameCache {
     eh_frame_len: usize,
     eh_frame_vaddr: u64,
     text_vaddr: u64,
+    /// .eh_frame_hdr for O(log n) FDE lookup (None if section missing)
+    eh_frame_hdr_offset: Option<usize>,
+    eh_frame_hdr_len: usize,
+    eh_frame_hdr_vaddr: u64,
     /// All PT_LOAD segments for per-segment bias lookup
     load_segments: Vec<LoadSegment>,
 }
@@ -180,17 +185,41 @@ impl DwarfUnwinder {
 
             let bases = BaseAddresses::default()
                 .set_eh_frame(eh_cache.eh_frame_vaddr)
+                .set_eh_frame_hdr(eh_cache.eh_frame_hdr_vaddr)
                 .set_text(eh_cache.text_vaddr);
 
             let mut ctx = UnwindContext::new();
 
-            // Look up unwind info for this address
-            let row = match eh_frame.unwind_info_for_address(
-                &bases,
-                &mut ctx,
-                relative_rip,
-                EhFrame::cie_from_offset,
-            ) {
+            // Look up unwind info — use .eh_frame_hdr binary search
+            // table when available (O(log n)), fall back to linear
+            // scan otherwise.
+            let row_result = if let Some(hdr_off) = eh_cache.eh_frame_hdr_offset {
+                let hdr_data = &eh_cache.mmap[hdr_off..hdr_off + eh_cache.eh_frame_hdr_len];
+                let hdr = EhFrameHdr::new(hdr_data, NativeEndian);
+                hdr.parse(&bases, 8).and_then(|parsed| {
+                    parsed
+                        .table()
+                        .ok_or(gimli::Error::NoUnwindInfoForAddress)
+                        .and_then(|table| {
+                            let fde = table.fde_for_address(
+                                &eh_frame,
+                                &bases,
+                                relative_rip,
+                                EhFrame::cie_from_offset,
+                            )?;
+                            fde.unwind_info_for_address(&eh_frame, &bases, &mut ctx, relative_rip)
+                        })
+                })
+            } else {
+                eh_frame.unwind_info_for_address(
+                    &bases,
+                    &mut ctx,
+                    relative_rip,
+                    EhFrame::cie_from_offset,
+                )
+            };
+
+            let row = match row_result {
                 Ok(row) => row,
                 Err(e) => {
                     if debug {
@@ -433,6 +462,9 @@ fn load_eh_frame(path: &PathBuf) -> io::Result<EhFrameCache> {
     let mut eh_frame_len = 0usize;
     let mut eh_frame_vaddr = 0u64;
     let mut text_vaddr = 0u64;
+    let mut eh_frame_hdr_offset = None;
+    let mut eh_frame_hdr_len = 0usize;
+    let mut eh_frame_hdr_vaddr = 0u64;
 
     for i in 0..e_shnum {
         let sh = e_shoff + i * e_shentsize;
@@ -452,6 +484,10 @@ fn load_eh_frame(path: &PathBuf) -> io::Result<EhFrameCache> {
             eh_frame_offset = sh_offset;
             eh_frame_len = sh_size;
             eh_frame_vaddr = sh_addr;
+        } else if name == ".eh_frame_hdr" {
+            eh_frame_hdr_offset = Some(sh_offset);
+            eh_frame_hdr_len = sh_size;
+            eh_frame_hdr_vaddr = sh_addr;
         } else if name == ".text" {
             text_vaddr = sh_addr;
         }
@@ -470,6 +506,9 @@ fn load_eh_frame(path: &PathBuf) -> io::Result<EhFrameCache> {
         eh_frame_len,
         eh_frame_vaddr,
         text_vaddr,
+        eh_frame_hdr_offset,
+        eh_frame_hdr_len,
+        eh_frame_hdr_vaddr,
         load_segments,
     })
 }
