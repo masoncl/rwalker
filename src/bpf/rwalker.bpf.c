@@ -57,10 +57,23 @@ struct task_stack {
 	u8 comm[TASK_COMM_LEN];
 };
 
+/* Lean dwarf sample — no embedded task_stack (avoids sending the unused
+ * 1016-byte ustack[] array).  user_stack is last so we can do
+ * variable-length ringbuf submissions.
+ */
 struct dwarf_sample {
-	struct task_stack ts;
+	pid_t pid;
+	pid_t tgid;
+	uint64_t cpu;
+	uint64_t wait_ns;
+	int32_t state;
+	int16_t kstack_len;
+	uint16_t _pad;
+	stackframe_t kstack[BPF_MAX_STACK_DEPTH];
+	u8 comm[TASK_COMM_LEN];
 	uint64_t user_regs[3]; /* RIP, RSP, RBP */
 	uint32_t stack_len;
+	uint32_t _pad2;
 	uint8_t user_stack[DWARF_STACK_SIZE];
 };
 
@@ -68,6 +81,16 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 192 * 1024 * 1024);
 } dwarf_events SEC(".maps");
+
+/* Per-CPU scratch buffer for building dwarf_sample entries before
+ * variable-length ringbuf output (too large for BPF stack).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct dwarf_sample);
+} dwarf_sample_scratch SEC(".maps");
 
 
 
@@ -288,14 +311,16 @@ static __always_inline void offcpu_dwarf_switch_out(struct task_struct *prev,
 }
 
 /* DWARF off-CPU switch-in: submit dwarf_sample with stored user data
- * and fresh kernel stack.
+ * and fresh kernel stack.  Uses scratch buffer + variable-length
+ * ringbuf output to avoid sending unused user_stack bytes.
  */
 static __always_inline void offcpu_dwarf_switch_in(struct task_struct *next,
 						   u32 next_pid, u64 now)
 {
 	struct offcpu_dwarf_val *stored;
 	struct dwarf_sample *ds;
-	u64 delta;
+	u32 zero = 0;
+	u64 delta, sz;
 
 	stored = bpf_map_lookup_elem(&offcpu_dwarf_start, &next_pid);
 	if (!stored)
@@ -308,40 +333,47 @@ static __always_inline void offcpu_dwarf_switch_in(struct task_struct *next,
 		return;
 	}
 
-	ds = bpf_ringbuf_reserve(&dwarf_events, sizeof(*ds), 0);
+	ds = bpf_map_lookup_elem(&dwarf_sample_scratch, &zero);
 	if (!ds) {
-		u32 zero = 0;
-		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
-		if (cnt)
-			__sync_fetch_and_add(cnt, 1);
 		bpf_map_delete_elem(&offcpu_dwarf_start, &next_pid);
 		return;
 	}
 
-	ds->ts.pid = stored->tgid;
-	ds->ts.tgid = next_pid;
-	ds->ts.task_ptr = 0;
-	ds->ts.wait_ns = delta;
-	ds->ts.switch_count = 0;
-	ds->ts.state = 0;
-	ds->ts.cpu = bpf_get_smp_processor_id();
+	ds->pid = stored->tgid;
+	ds->tgid = next_pid;
+	ds->wait_ns = delta;
+	ds->state = 0;
+	ds->cpu = bpf_get_smp_processor_id();
+	ds->_pad = 0;
+	ds->_pad2 = 0;
 
-	bpf_probe_read_kernel_str(ds->ts.comm, TASK_COMM_LEN, next->comm);
+	bpf_probe_read_kernel_str(ds->comm, TASK_COMM_LEN, next->comm);
 
-	ds->ts.kstack_len = write_task_stack(next, ds->ts.kstack, 0);
-	ds->ts.ustack_len = 0;
+	ds->kstack_len = write_task_stack(next, ds->kstack, 0);
 
 	/* Replay stored user registers and raw stack */
 	ds->user_regs[0] = stored->user_regs[0];
 	ds->user_regs[1] = stored->user_regs[1];
 	ds->user_regs[2] = stored->user_regs[2];
 	ds->stack_len = stored->stack_len;
-	if (stored->stack_len > 0)
-		bpf_probe_read_kernel(ds->user_stack, DWARF_STACK_SIZE,
+	if (stored->stack_len > 0) {
+		u32 copy_len = stored->stack_len;
+		if (copy_len > DWARF_STACK_SIZE)
+			copy_len = DWARF_STACK_SIZE;
+		bpf_probe_read_kernel(ds->user_stack, copy_len,
 				      stored->user_stack);
+	}
 
 	bpf_map_delete_elem(&offcpu_dwarf_start, &next_pid);
-	bpf_ringbuf_submit(ds, 0);
+
+	sz = __builtin_offsetof(struct dwarf_sample, user_stack) + ds->stack_len;
+	if (sz > sizeof(*ds))
+		sz = sizeof(*ds);
+	if (bpf_ringbuf_output(&dwarf_events, ds, sz, 0) != 0) {
+		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
+	}
 }
 
 SEC("tp_btf/sched_switch")
@@ -436,44 +468,46 @@ int offcpu_switch(u64 *ctx)
 	return 0;
 }
 
-/* Submit a dwarf sample: task_stack (kernel stack only) + raw user
- * stack dump + registers.  Called from profile/trace/kfunc when
- * dwarf_mode is enabled.
+/* Submit a dwarf sample via scratch buffer + variable-length ringbuf
+ * output.  Called from profile/trace/kfunc when dwarf_mode is enabled.
  */
 static __always_inline int submit_dwarf_sample(struct task_struct *task)
 {
 	struct dwarf_sample *ds;
+	u32 zero = 0;
+	u64 sz;
 
-	ds = bpf_ringbuf_reserve(&dwarf_events, sizeof(*ds), 0);
-	if (!ds) {
-		u32 zero = 0;
-		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
-		if (cnt)
-			__sync_fetch_and_add(cnt, 1);
+	ds = bpf_map_lookup_elem(&dwarf_sample_scratch, &zero);
+	if (!ds)
 		return 0;
-	}
 
-	ds->ts.pid = task->tgid;
-	ds->ts.tgid = task->pid;
-	ds->ts.task_ptr = 0;
-	ds->ts.wait_ns = 0;
-	ds->ts.switch_count = 0;
-	ds->ts.state = 0;
-	ds->ts.cpu = bpf_get_smp_processor_id();
+	ds->pid = task->tgid;
+	ds->tgid = task->pid;
+	ds->wait_ns = 0;
+	ds->state = 0;
+	ds->cpu = bpf_get_smp_processor_id();
+	ds->_pad = 0;
+	ds->_pad2 = 0;
 
-	if (bpf_get_current_comm(ds->ts.comm, TASK_COMM_LEN))
-		ds->ts.comm[0] = 0;
+	if (bpf_get_current_comm(ds->comm, TASK_COMM_LEN))
+		ds->comm[0] = 0;
 
 	/* Kernel stack — use bpf_get_task_stack instead of bpf_get_stack
 	 * so this works in fentry/raw_tp context where ctx is not pt_regs.
 	 */
-	ds->ts.kstack_len = write_task_stack(task, ds->ts.kstack, 0);
-	ds->ts.ustack_len = 0;
+	ds->kstack_len = write_task_stack(task, ds->kstack, 0);
 
 	capture_user_dwarf(task, ds->user_regs,
 			   ds->user_stack, &ds->stack_len);
 
-	bpf_ringbuf_submit(ds, 0);
+	sz = __builtin_offsetof(struct dwarf_sample, user_stack) + ds->stack_len;
+	if (sz > sizeof(*ds))
+		sz = sizeof(*ds);
+	if (bpf_ringbuf_output(&dwarf_events, ds, sz, 0) != 0) {
+		u64 *cnt = bpf_map_lookup_elem(&drop_count, &zero);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
+	}
 	return 0;
 }
 

@@ -135,14 +135,26 @@ pub type DwarfSamples = Rc<RefCell<Vec<RawDwarfSample>>>;
 
 const DWARF_STACK_SIZE: usize = 16384;
 
-/// Layout must match struct dwarf_sample in rwalker.bpf.c
+/// Fixed-size header of struct dwarf_sample in rwalker.bpf.c.
+/// The user_stack bytes follow immediately after this header;
+/// their length is variable (= stack_len).
 #[repr(C)]
-struct DwarfSample {
-    ts: task_stack,
+struct DwarfSampleHdr {
+    pid: i32,
+    tgid: i32,
+    cpu: u64,
+    wait_ns: u64,
+    state: i32,
+    kstack_len: i16,
+    _pad: u16,
+    kstack: [u64; BPF_MAX_STACK_DEPTH],
+    comm: [u8; crate::skel::TASK_COMM_LEN],
     user_regs: [u64; 3],
     stack_len: u32,
-    user_stack: [u8; DWARF_STACK_SIZE],
+    _pad2: u32,
 }
+
+const DWARF_HDR_SIZE: usize = mem::size_of::<DwarfSampleHdr>();
 
 fn dwarf_event_handler(
     total_events: &Rc<RefCell<u64>>,
@@ -150,28 +162,31 @@ fn dwarf_event_handler(
     dwarf_samples: &DwarfSamples,
     data: &[u8],
 ) -> ::std::os::raw::c_int {
-    if data.len() != mem::size_of::<DwarfSample>() {
+    if data.len() < DWARF_HDR_SIZE {
         return 0;
     }
 
-    let sample = unsafe { &*(data.as_ptr() as *const DwarfSample) };
+    let hdr = unsafe { &*(data.as_ptr() as *const DwarfSampleHdr) };
 
-    if sample.ts.kstack_len <= 0 && sample.user_regs[0] == 0 {
+    if hdr.kstack_len <= 0 && hdr.user_regs[0] == 0 {
         return 0;
     }
 
     *total_events.borrow_mut() += 1;
-    *total_ns.borrow_mut() += sample.ts.wait_ns;
+    *total_ns.borrow_mut() += hdr.wait_ns;
 
-    let stack_len = (sample.stack_len as usize).min(DWARF_STACK_SIZE);
+    let stack_len = (hdr.stack_len as usize)
+        .min(DWARF_STACK_SIZE)
+        .min(data.len() - DWARF_HDR_SIZE);
+    let user_stack = &data[DWARF_HDR_SIZE..DWARF_HDR_SIZE + stack_len];
     dwarf_samples.borrow_mut().push(RawDwarfSample {
-        pid: sample.ts.pid,
-        kstack: sample.ts.kstack,
-        kstack_len: sample.ts.kstack_len,
-        comm: sample.ts.comm,
-        wait_ns: sample.ts.wait_ns,
-        user_regs: sample.user_regs,
-        user_stack: sample.user_stack[..stack_len].to_vec(),
+        pid: hdr.pid,
+        kstack: hdr.kstack,
+        kstack_len: hdr.kstack_len,
+        comm: hdr.comm,
+        wait_ns: hdr.wait_ns,
+        user_regs: hdr.user_regs,
+        user_stack: user_stack.to_vec(),
     });
 
     0
