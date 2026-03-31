@@ -1210,15 +1210,15 @@ fn main() -> Result<()> {
     }
 
     let mut cpus_to_profile: Option<Vec<u32>> = None;
-    if options.cpus.is_some() {
-        match parse_cpumask(options.cpus.as_ref().unwrap()) {
+    if let Some(ref cpu_str) = options.cpus {
+        match parse_cpumask(cpu_str) {
             Ok(g) => cpus_to_profile = Some(g),
             Err(err) => {
                 eprintln!("Invalid cpu string for profiling: {}", err);
                 std::process::exit(1);
             }
         }
-        println!("Profiling CPUS: {}", options.cpus.as_ref().unwrap());
+        println!("Profiling CPUS: {}", cpu_str);
     }
 
     // load skeleton into kernel
@@ -1282,6 +1282,8 @@ fn main() -> Result<()> {
             loop {
                 let elapsed = start.elapsed();
                 if elapsed >= profile_duration {
+                    let total = *profiler.as_ref().unwrap().total_events.borrow();
+                    eprintln!("Recording complete ({total} samples), processing...");
                     profiler.as_mut().unwrap().unwind_dwarf_samples();
                     // Read drop count from BPF per-CPU array
                     let key = 0u32.to_ne_bytes();

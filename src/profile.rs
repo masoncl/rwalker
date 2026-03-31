@@ -120,18 +120,50 @@ fn event_handler(
     0
 }
 
-/// Raw dwarf sample stored for deferred unwinding
-pub struct RawDwarfSample {
-    pub pid: i32,
-    pub kstack: [u64; BPF_MAX_STACK_DEPTH],
-    pub kstack_len: i16,
-    pub comm: [u8; crate::skel::TASK_COMM_LEN],
-    pub wait_ns: u64,
-    pub user_regs: [u64; 3],
-    pub user_stack: Vec<u8>,
+/// Pre-grouped DWARF sample.  Deduplication by (pid, RIP, RSP) happens
+/// in the ringbuf callback so duplicate stacks never allocate.
+struct DwarfGroup {
+    pid: i32,
+    regs: [u64; 3],
+    stack_off: usize, // offset into DwarfAccum.arena
+    stack_len: usize,
+    kstack: [u64; BPF_MAX_STACK_DEPTH],
+    kstack_len: i16,
+    hits: u64,
+    wait_ns: u64,
+    comms: HashSet<[u8; crate::skel::TASK_COMM_LEN]>,
 }
 
-pub type DwarfSamples = Rc<RefCell<Vec<RawDwarfSample>>>;
+/// Accumulator for DWARF samples.  Groups are keyed by (pid, RIP, RSP)
+/// and user-stack bytes are appended to a single arena buffer to avoid
+/// per-sample allocations.
+pub struct DwarfAccum {
+    groups: HashMap<(i32, u64, u64), DwarfGroup>,
+    arena: Vec<u8>,
+}
+
+const DWARF_ARENA_INIT: usize = 4 * 1024 * 1024; // 4 MB
+const DWARF_GROUPS_INIT: usize = 4096;
+
+impl DwarfAccum {
+    fn new() -> Self {
+        DwarfAccum {
+            groups: HashMap::with_capacity(DWARF_GROUPS_INIT),
+            arena: Vec::with_capacity(DWARF_ARENA_INIT),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.groups.clear();
+        self.arena.clear();
+    }
+
+    fn stack_bytes(&self, g: &DwarfGroup) -> &[u8] {
+        &self.arena[g.stack_off..g.stack_off + g.stack_len]
+    }
+}
+
+pub type DwarfSamples = Rc<RefCell<DwarfAccum>>;
 
 const DWARF_STACK_SIZE: usize = 16384;
 
@@ -178,16 +210,40 @@ fn dwarf_event_handler(
     let stack_len = (hdr.stack_len as usize)
         .min(DWARF_STACK_SIZE)
         .min(data.len() - DWARF_HDR_SIZE);
-    let user_stack = &data[DWARF_HDR_SIZE..DWARF_HDR_SIZE + stack_len];
-    dwarf_samples.borrow_mut().push(RawDwarfSample {
-        pid: hdr.pid,
-        kstack: hdr.kstack,
-        kstack_len: hdr.kstack_len,
-        comm: hdr.comm,
-        wait_ns: hdr.wait_ns,
-        user_regs: hdr.user_regs,
-        user_stack: user_stack.to_vec(),
-    });
+
+    let mut accum = dwarf_samples.borrow_mut();
+    let key = (hdr.pid, hdr.user_regs[0], hdr.user_regs[1]);
+
+    if let Some(group) = accum.groups.get_mut(&key) {
+        // Duplicate — just bump counters, no allocation.
+        group.hits += 1;
+        group.wait_ns += hdr.wait_ns;
+        group.comms.insert(hdr.comm);
+    } else {
+        // First occurrence — append stack bytes to arena.
+        let stack_off = accum.arena.len();
+        accum
+            .arena
+            .extend_from_slice(&data[DWARF_HDR_SIZE..DWARF_HDR_SIZE + stack_len]);
+        accum.groups.insert(
+            key,
+            DwarfGroup {
+                pid: hdr.pid,
+                regs: hdr.user_regs,
+                stack_off,
+                stack_len,
+                kstack: hdr.kstack,
+                kstack_len: hdr.kstack_len,
+                hits: 1,
+                wait_ns: hdr.wait_ns,
+                comms: {
+                    let mut s = HashSet::new();
+                    s.insert(hdr.comm);
+                    s
+                },
+            },
+        );
+    }
 
     0
 }
@@ -211,7 +267,7 @@ impl<'a> Profiler<'a> {
             perf_stack_map: Rc::new(RefCell::new(HashMap::new())),
             total_events: Rc::new(RefCell::new(0)),
             total_ns: Rc::new(RefCell::new(0)),
-            dwarf_samples: Rc::new(RefCell::new(Vec::new())),
+            dwarf_samples: Rc::new(RefCell::new(DwarfAccum::new())),
             ringbuf: None,
             pefds: None,
             links: None,
@@ -379,51 +435,17 @@ impl<'a> Profiler<'a> {
         self.pefds.take();
     }
     /// Unwind deferred dwarf samples and merge into the perf_stack_map.
-    /// Deduplicates by (pid, RIP, RSP) — samples with the same user
-    /// register state produce the same unwind, so we only unwind each
-    /// unique state once.
+    /// Samples are already deduplicated by (pid, RIP, RSP) in the ringbuf
+    /// callback, so we just sort by hits and unwind the top groups.
     pub fn unwind_dwarf_samples(&mut self) {
         if !self.dwarf {
             return;
         }
 
-        let samples = self.dwarf_samples.borrow();
-
-        // Group samples by (pid, RIP, RSP) — same user register state
-        // means same unwind result.  Accumulate hits and collect the
-        // kernel stacks + comms for each group.
-        struct DwarfGroup {
-            hits: u64,
-            wait_ns: u64,
-            pid: i32,
-            regs: [u64; 3],
-            stack: Vec<u8>,
-            // representative kernel stack + comms
-            kstack: [u64; BPF_MAX_STACK_DEPTH],
-            kstack_len: i16,
-            comms: HashSet<[u8; crate::skel::TASK_COMM_LEN]>,
-        }
-
-        let mut groups: HashMap<(i32, u64, u64), DwarfGroup> = HashMap::new();
-        for sample in samples.iter() {
-            let key = (sample.pid, sample.user_regs[0], sample.user_regs[1]);
-            let group = groups.entry(key).or_insert_with(|| DwarfGroup {
-                hits: 0,
-                wait_ns: 0,
-                pid: sample.pid,
-                regs: sample.user_regs,
-                stack: sample.user_stack.clone(),
-                kstack: sample.kstack,
-                kstack_len: sample.kstack_len,
-                comms: HashSet::new(),
-            });
-            group.hits += 1;
-            group.wait_ns += sample.wait_ns;
-            group.comms.insert(sample.comm);
-        }
+        let accum = self.dwarf_samples.borrow();
 
         // Sort by hits (heaviest first), cap at 500 unwinds
-        let mut sorted_groups: Vec<_> = groups.values().collect();
+        let mut sorted_groups: Vec<_> = accum.groups.values().collect();
         sorted_groups.sort_by(|a, b| b.hits.cmp(&a.hits));
         sorted_groups.truncate(500);
 
@@ -431,12 +453,13 @@ impl<'a> Profiler<'a> {
         let mut map = self.perf_stack_map.borrow_mut();
 
         for group in sorted_groups {
+            let stack = accum.stack_bytes(group);
             let uframes = unwinder.unwind(
                 group.pid,
                 group.regs[0],
                 group.regs[1],
                 group.regs[2],
-                &group.stack,
+                stack,
             );
 
             let mut ustack = [0u64; BPF_MAX_STACK_DEPTH];
@@ -461,7 +484,7 @@ impl<'a> Profiler<'a> {
     pub fn reset_frames(&mut self) {
         let mut map = self.perf_stack_map.borrow_mut();
         map.clear();
-        self.dwarf_samples.borrow_mut().clear();
+        self.dwarf_samples.borrow_mut().clear(); // clears both groups + arena
         *self.total_events.borrow_mut() = 0;
         *self.total_ns.borrow_mut() = 0;
     }
