@@ -1297,6 +1297,7 @@ fn main() -> Result<()> {
             loop {
                 let elapsed = start.elapsed();
                 if elapsed >= profile_duration {
+                    profiler.as_mut().unwrap().close();
                     let total = *profiler.as_ref().unwrap().total_events.borrow();
                     eprintln!("Recording complete ({total} samples), processing...");
                     profiler.as_mut().unwrap().unwind_dwarf_samples();
