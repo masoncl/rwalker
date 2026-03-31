@@ -1109,6 +1109,9 @@ pub struct Options {
     /// ringbuf size in MB for frame-pointer samples
     #[clap(long, value_parser, default_value_t = 64)]
     ringbuf_size: u32,
+    /// only profile this PID (and all its threads)
+    #[clap(long, value_parser)]
+    pid: Option<i32>,
 }
 
 fn main() -> Result<()> {
@@ -1184,6 +1187,9 @@ fn main() -> Result<()> {
         .events
         .set_max_entries(options.ringbuf_size * 1024 * 1024)
         .expect("failed to set events ringbuf size");
+    if let Some(pid) = options.pid {
+        rodata.target_tgid = pid;
+    }
     if options.dwarf {
         rodata.dwarf_mode = 1;
         open_skel
@@ -1252,6 +1258,15 @@ fn main() -> Result<()> {
             use_kfunc,
             options.dwarf,
         )?;
+        eprintln!(
+            "rwalker pid {} profiling{}",
+            std::process::id(),
+            if let Some(pid) = options.pid {
+                format!(" pid {pid}")
+            } else {
+                String::new()
+            }
+        );
     }
 
     let mut loops = 0;

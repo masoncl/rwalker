@@ -29,6 +29,7 @@ struct {
 const volatile int iter_mode = 0;
 const volatile uint64_t offcpu_min_ns = 1000000; /* 1ms default threshold */
 const volatile int dwarf_mode = 0;
+const volatile int target_tgid = 0; /* 0 = all processes */
 
 /* Counters for dropped samples due to ringbuf overflow */
 struct {
@@ -389,9 +390,9 @@ int offcpu_switch(u64 *ctx)
 	u32 next_pid = next->pid;
 
 	if (dwarf_mode) {
-		if (prev_pid != 0)
+		if (prev_pid != 0 && (!target_tgid || prev->tgid == target_tgid))
 			offcpu_dwarf_switch_out(prev, prev_pid, now);
-		if (next_pid != 0)
+		if (next_pid != 0 && (!target_tgid || next->tgid == target_tgid))
 			offcpu_dwarf_switch_in(next, next_pid, now);
 		return 0;
 	}
@@ -399,7 +400,7 @@ int offcpu_switch(u64 *ctx)
 	/* Record switch-out: capture timestamp and user stack from prev
 	 * while its mm is still active.
 	 */
-	if (prev_pid != 0) {
+	if (prev_pid != 0 && (!target_tgid || prev->tgid == target_tgid)) {
 		struct offcpu_val val = {};
 		int32_t res;
 
@@ -520,6 +521,9 @@ static __always_inline int submit_sample(void *ctx)
 	struct task_struct *task = bpf_get_current_task_btf();
 	struct task_stack *t;
 	int32_t res;
+
+	if (target_tgid && task->tgid != target_tgid)
+		return 0;
 
 	if (dwarf_mode)
 		return submit_dwarf_sample(task);
