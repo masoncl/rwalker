@@ -1240,11 +1240,11 @@ fn main() -> Result<()> {
     if is_profiling {
         profiler = Some(profile::Profiler::new(cpus_to_profile));
         let offcpu = options.offcpu > 0;
-        // In dwarf mode, reduce default frequency — each sample is ~18KB
-        // vs ~2KB without dwarf.  Only apply if user didn't set -f explicitly.
+        // In dwarf mode, reduce default frequency — each sample is larger
+        // than frame-pointer mode.  Only apply if user didn't set -f explicitly.
         let freq = if options.dwarf && options.freq == 4000 {
-            eprintln!("dwarf: reducing sampling frequency to 200 Hz (use -f to override)");
-            200
+            eprintln!("dwarf: reducing sampling frequency to 1000 Hz (use -f to override)");
+            1000
         } else {
             options.freq
         };
