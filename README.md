@@ -63,6 +63,18 @@ target binaries):
 rwalker -p 5 -u
 ```
 
+Add `--dwarf` for DWARF-based user stack unwinding — works on binaries
+compiled without frame pointers by capturing raw stack memory in BPF
+and unwinding via `.eh_frame` in userspace:
+
+```
+rwalker -p 5 -u --dwarf
+```
+
+DWARF mode automatically reduces the sampling frequency to 1000 Hz
+(override with `-f`).  For high-rate tracepoints, increase the DWARF
+ringbuf with `--dwarf-ringbuf-size`.
+
 ### Off-CPU profiling
 
 ```
@@ -80,6 +92,12 @@ the process mm is still active):
 
 ```
 rwalker --offcpu 5 -u
+```
+
+DWARF unwinding also works with off-CPU profiling:
+
+```
+rwalker --offcpu 5 -u --dwarf
 ```
 
 ### Tracepoint tracing
@@ -126,6 +144,8 @@ Options:
       --trace <N:S>    Trace a raw tracepoint (e.g. sched_switch:5)
       --kfunc <N:S>    Trace a kernel function via fentry (e.g. ksys_write:5)
   -u, --user           Include user-space stacks (requires frame pointers)
+      --dwarf          Use DWARF unwinding for user stacks (no frame pointers needed)
+      --dwarf-ringbuf-size <MB>  DWARF ringbuf size in MB [default: 192]
   -P, --cpus <CPUS>    CPU mask for profiling (e.g. "0-3" or "1,4,7")
   -f, --freq <N>       Sampling frequency in Hz [default: 4000]
       --sw-perf        Force software CPU clock events instead of hardware PMU
@@ -157,6 +177,11 @@ rwalker -a -c btrfs -v
 Profile with user-space stacks, filtered to a specific process:
 ```
 rwalker -p 5 -u -c myapp
+```
+
+Profile with DWARF user stacks (no frame pointers needed):
+```
+rwalker -p 5 -u --dwarf -c myapp
 ```
 
 Find what's blocking a process:
@@ -280,7 +305,10 @@ offset and source location.  Symbolization is batched and cached:
 leaf addresses are resolved first to filter by 0.25% threshold before
 full-stack symbolization, and a per-address cache avoids redundant
 blazesym calls.  User stacks from frame-pointer-less binaries are
-trimmed.  `.gnu_debugdata` (MiniDebugInfo) is supported via the
+trimmed when using frame-pointer unwinding.  With `--dwarf`, raw stack
+memory is captured in BPF and unwound in userspace via `.eh_frame_hdr`
+for O(log n) FDE lookup, producing accurate user stacks without frame
+pointers.  `.gnu_debugdata` (MiniDebugInfo) is supported via the
 blazesym xz feature.
 
 ## Dependencies
