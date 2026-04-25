@@ -303,6 +303,37 @@ fn run_kernel_iter(
     task_list
 }
 
+// Symbolize a kernel stack into a vector of "name+0xoffset" strings.
+fn symbolize_stack(
+    ts: &task_stack,
+    src: &Source<'_>,
+    symbolizer: &symbolize::Symbolizer,
+) -> Vec<String> {
+    let frames = ts.kstack_len as usize;
+    let stack = &ts.kstack[..frames];
+    if stack.is_empty() {
+        return Vec::new();
+    }
+    let syms = match symbolizer.symbolize(src, symbolize::Input::AbsAddr(stack)) {
+        Ok(syms) => syms,
+        Err(_) => return stack.iter().map(|a| format!("{a:#x}")).collect(),
+    };
+    stack
+        .iter()
+        .copied()
+        .zip(syms)
+        .map(|(addr, sym)| match sym {
+            symbolize::Symbolized::Sym(s) => format!("{}+{:#x}", s.name, s.offset),
+            symbolize::Symbolized::Unknown(_) => format!("{addr:#x}"),
+        })
+        .collect()
+}
+
+// Escape a string for JSON output (handles quotes and backslashes).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn walk_tasks(
     link: &Link,
     task_pid_map: &mut HashMap<(i32, u64), Task>,
@@ -322,7 +353,7 @@ fn walk_tasks(
     drop_dead_tasks(task_pid_map);
 
     if task_list.is_empty() {
-        if !options.stuck && options.waiting > 0 {
+        if !options.json && !options.stuck && options.waiting > 0 {
             println!("no tasks waited for at least {} seconds", options.waiting);
         }
         return false;
@@ -333,6 +364,35 @@ fn walk_tasks(
         ..Default::default()
     };
     let src = Source::from(kernel);
+
+    // JSON output mode: one JSONL line per task, no histogram
+    if options.json {
+        let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+        for task in task_list.iter() {
+            let comm = task.comm();
+            if let Some(ref re) = comm_re {
+                if !re.is_match(&comm) {
+                    continue;
+                }
+            }
+            let kstack = symbolize_stack(&task.ts, &src, symbolizer);
+            let kstack_json: Vec<String> = kstack
+                .iter()
+                .map(|s| format!("\"{}\"", json_escape(s)))
+                .collect();
+            println!(
+                "{{\"timestamp\":\"{}\",\"comm\":\"{}\",\"pid\":{},\"state\":\"{}\",\"wait_seconds\":{:.2},\"cpu\":{},\"kstack\":[{}]}}",
+                timestamp,
+                json_escape(&comm),
+                task.ts.pid,
+                task.state(),
+                task.wait_time,
+                task.ts.cpu,
+                kstack_json.join(","),
+            );
+        }
+        return true;
+    }
 
     let mut task_stack_map: HashMap<Vec<u64>, TaskCounter<'_>> = HashMap::new();
 
@@ -1112,6 +1172,9 @@ pub struct Options {
     /// only profile this PID (and all its threads)
     #[clap(long, value_parser)]
     pid: Option<i32>,
+    /// emit JSONL output (one line per task) instead of human-readable text
+    #[clap(long, short = 'j', action = clap::ArgAction::SetTrue)]
+    json: bool,
 }
 
 fn main() -> Result<()> {
@@ -1182,10 +1245,21 @@ fn main() -> Result<()> {
     } else {
         rodata.iter_mode = RWALKER_ITER_MODE_DSTATE;
     }
+    // Only allocate full-size ringbufs when profiling; task iteration
+    // (default/--stuck) doesn't use them, so minimize to avoid OOM.
+    let is_prof = options.profile > 0
+        || options.offcpu > 0
+        || options.trace.is_some()
+        || options.kfunc.is_some();
+    let events_size = if is_prof {
+        options.ringbuf_size * 1024 * 1024
+    } else {
+        4096 // minimum valid ringbuf size (one page)
+    };
     open_skel
         .maps
         .events
-        .set_max_entries(options.ringbuf_size * 1024 * 1024)
+        .set_max_entries(events_size)
         .expect("failed to set events ringbuf size");
     if let Some(pid) = options.pid {
         rodata.target_tgid = pid;
@@ -1198,7 +1272,12 @@ fn main() -> Result<()> {
             .set_max_entries(options.dwarf_ringbuf_size * 1024 * 1024)
             .expect("failed to set dwarf_events ringbuf size");
     } else {
-        // Minimize DWARF offcpu maps when not in DWARF mode
+        // Minimize DWARF maps when not in DWARF mode
+        open_skel
+            .maps
+            .dwarf_events
+            .set_max_entries(4096)
+            .expect("failed to set dwarf_events ringbuf size");
         open_skel
             .maps
             .offcpu_dwarf_start
@@ -1206,13 +1285,19 @@ fn main() -> Result<()> {
             .expect("failed to set offcpu_dwarf_start size");
     }
 
-    //
-    // in stuck mode, loop a few times and exit as soon as we find some
-    // D state tasks.
+    // In stuck mode, set defaults for interval/count/waiting if not
+    // explicitly provided.  This lets callers override (e.g.
+    // --stuck --interval 10) without being silently clobbered.
     if options.stuck {
-        options.interval = 2;
-        options.count = 5;
-        options.waiting = 1;
+        if options.interval == 0 {
+            options.interval = 2;
+        }
+        if options.count == 0 {
+            options.count = 5;
+        }
+        if options.waiting == 0 {
+            options.waiting = 1;
+        }
     }
 
     let mut cpus_to_profile: Option<Vec<u32>> = None;
@@ -1271,7 +1356,7 @@ fn main() -> Result<()> {
 
     let mut loops = 0;
     loop {
-        if options.interval > 0 && !options.stuck {
+        if options.interval > 0 && !options.stuck && !options.json {
             println!("=== {} ===", Local::now().format("%Y-%m-%d %H:%M:%S"));
         }
 
@@ -1343,7 +1428,7 @@ fn main() -> Result<()> {
 
         loops += 1;
 
-        if (found && options.stuck)
+        if (found && options.stuck && options.count > 0)
             || options.interval <= 0
             || (options.count > 0 && loops >= options.count)
         {
